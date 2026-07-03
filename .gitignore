@@ -1,0 +1,61 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.venv/
+build/
+dist/
+
+# ---- Editor / OS / local settings ----
+.claude/
+.DS_Store
+*.swp
+
+# ---- Data & instrument metadata (never distributed) ----
+data/
+*.mseed
+*.sac
+*.h5
+*.hdf5
+
+# ---- Stage outputs ----
+rf_out/
+hk_out/
+ccp_out/
+ant/
+tomo/
+inversion/
+figures/
+dsurftomo/
+logs/
+
+# ---- Paper, supplement & reference catalogs (copyright / large) ----
+*.pdf
+*.zip
+se-17-711-2026-supplement/
+zeckra_2/
+criado-sutti_1/
+
+# ---- external tool clones / verification refs ----
+refs/
+BayHunter/
+DSurfTomo/
+amb_noise_tools/
+RfSurfHmc/
+seispy/
+
+# ---- unrelated / scratch / experimental scripts (not part of the pipeline) ----
+# The pipeline is only rf_pipeline/*.py and run_*.py — anything below is ignored so
+# throwaway scripts, notebooks and scratch dirs never land in the repo.
+scratch/
+sandbox/
+tmp/
+scratch_*.py
+tmp_*.py
+test_*.py
+*_scratch.py
+*_tmp.py
+untitled*.py
+*.ipynb
+Untitled*.ipynb

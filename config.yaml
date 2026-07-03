@@ -1,0 +1,245 @@
+# =============================================================================
+# Dieng RF + ANT joint-inversion pipeline — MASTER CONFIG
+# -----------------------------------------------------------------------------
+# This is the ONLY file a user edits. Every runner script is called as:
+#     python run_<stage>.py --config config.yaml
+# and reads its parameters from the matching section below. No parameters are
+# passed on the command line and none are hard-coded in the scripts.
+# =============================================================================
+
+project:
+  name: dieng_rf
+  root: /home/kadek/Documents/ITS/collaboration/Dieng/RF
+  # All paths below are relative to `root` unless absolute.
+  paths:
+    continuous:   data/continuous       # day-long 3C MiniSEED per station
+    stationxml:   data/stationxml       # inventory + full instrument response
+    catalogs:     data/catalogs
+    rf_out:       rf_out
+    hk_out:       hk_out
+    ccp_out:      ccp_out
+    ccfs:         ant/ccfs
+    disp:         ant/disp
+    tomo:         tomo
+    inversion:    inversion
+    figures:      figures
+  log_level: INFO
+
+# -----------------------------------------------------------------------------
+# STAGE 1 — data / event catalogs (one block per source class; all three used)
+# -----------------------------------------------------------------------------
+data:
+  sampling_rate: 100.0          # Hz of the continuous data
+  components: [Z, N, E]
+  response_output: VEL          # DISP | VEL | ACC for response removal
+  pre_filt: [0.05, 0.1, 40, 45] # response-removal taper corners (Hz)
+  # ---- where the real Dieng 3C data + metadata live (edit for your machine) ----
+  # SmartSolo 3C daily files (DG.STxx.YYYY-MM-DD.mseed). run_prep symlinks these
+  # into project.paths.continuous; leave null if that dir is already populated.
+  source_waveform_dir: /media/kadek/My Book/Collaborations/Dieng_BB/waveforms_3c
+  # Station coords (whitespace NET.STA. lat lon elev). Reused from repeater_pipeline.
+  station_file: ../repeater_pipeline/station.txt
+  # Merged StationXML with full DH?/DP? responses (built by the repeater pipeline's
+  # scripts/build_dieng_inventory.py). run_prep stages it into data/stationxml/.
+  inventory: ../repeater_pipeline/config/dieng_inventory.xml
+  # date_range: null -> use the full span discoverable in the data.
+  date_range: null
+  copy_instead_of_link: false
+
+catalogs:
+  # Each class can be fetched from a provider or supplied as a local QuakeML.
+  teleseismic:
+    enabled: true
+    file: data/catalogs/teleseismic.xml   # if exists, used directly
+    fetch:                                  # else built from provider
+      provider: USGS
+      min_distance_deg: 30
+      max_distance_deg: 90
+      min_magnitude: 5.5
+  regional:
+    enabled: true
+    file: data/catalogs/regional.xml
+    fetch:
+      provider: ISC
+      min_distance_deg: 2
+      max_distance_deg: 30
+      min_magnitude: 4.0
+  local_deep:
+    enabled: true
+    file: data/catalogs/local_deep.xml      # Java slab Wadati–Benioff events
+    fetch:
+      provider: ISC
+      max_distance_deg: 5
+      min_depth_km: 100
+      min_magnitude: 1.5
+
+# -----------------------------------------------------------------------------
+# STAGE 2 — receiver functions (rf). `defaults` apply to every class; each
+# class block OVERRIDES only what differs. This is how local-deep / regional /
+# teleseismic are all supported from one config.
+# -----------------------------------------------------------------------------
+rf:
+  defaults:
+    phase: P
+    deconvolve: time            # time (iterative) | freqattr (water-level)
+    deconv_params: {f1: 0.03, f2: 20.0, max_iters: 400, min_deltaE: 0.001}
+    window: [-10, 35]           # s relative to P
+    noise_window: [-30, -10]    # s, for SNR
+    snr_min: 1.5
+    bin_baz_deg: 10             # back-azimuth binning width
+    bin_overlap_deg: 5
+    moveout_ref_slowness: 0.06  # s/km reference for moveout
+    stack: linear               # linear | phase_weighted
+  classes:
+    teleseismic:
+      rotate: ZNE->RT
+      gauss: 1.5                 # Gaussian width a (~<=1 Hz)
+      slowness_range: [0.04, 0.08]
+    regional:
+      rotate: ZNE->RT
+      gauss: 2.5
+      slowness_range: [0.06, 0.10]
+    local_deep:
+      rotate: ZNE->LQT           # steep incidence -> LQT
+      gauss: 3.0                 # high-frequency content (suits 5 Hz nodes)
+      slowness_range: [0.00, 0.05]
+      local_model: data/local_1d.nd   # for per-event ray-parameter (TauPy/cake)
+
+# -----------------------------------------------------------------------------
+# STAGE 3 — H–k stacking (rf / seispy)
+# -----------------------------------------------------------------------------
+hk:
+  vp_crust: 6.0                 # km/s assumed
+  h_range:  [0, 70]             # km
+  h_step:   2.0
+  k_range:  [1.6, 2.5]
+  k_step:   0.05
+  weights:  [0.6, 0.3, 0.1]     # Ps, PpPs, PsPs amplitude weights
+  depth_correct_k: true         # bottom-up recursive k correction (paper App. A)
+  run_on: [teleseismic, local_deep]
+
+# -----------------------------------------------------------------------------
+# STAGE 4 — CCP migration (seispy)
+# -----------------------------------------------------------------------------
+ccp:
+  velocity_model: data/ccp_model.txt
+  depth_range: [0, 60]          # km
+  depth_step: 0.5
+  run_on: [teleseismic, local_deep]
+  profiles:
+    - {name: NS, lon1: 109.85, lat1: -7.10, lon2: 109.95, lat2: -7.30, width_km: 10}
+    - {name: EW, lon1: 109.80, lat1: -7.20, lon2: 110.00, lat2: -7.20, width_km: 10}
+
+# -----------------------------------------------------------------------------
+# STAGE 5 — ambient-noise cross-correlation (NoisePy)
+# -----------------------------------------------------------------------------
+ant:
+  cc_len: 3600                  # s, correlation window
+  cc_step: 1800                 # s, overlap step
+  freq_norm: rma                # spectral whitening method
+  time_norm: one_bit            # temporal normalization
+  freqmin: 0.1
+  freqmax: 5.0
+  maxlag: 100                   # s
+  components: ZZ                # Rayleigh
+  stack_method: pws             # phase-weighted stack of all days
+
+# -----------------------------------------------------------------------------
+# STAGE 6 — dispersion measurement (amb_noise_tools, FTAN)
+# -----------------------------------------------------------------------------
+dispersion:
+  periods: [0.5, 0.75, 1, 1.5, 2, 3, 4, 5, 6, 8]   # s (node-realistic band)
+  measure: [phase, group]
+  min_wavelengths: 2            # reject paths shorter than N wavelengths
+  snr_min: 5.0
+
+# -----------------------------------------------------------------------------
+# STAGE 7 — dispersion -> per-station curve
+# -----------------------------------------------------------------------------
+tomo:
+  path: A                       # A = full tomography (FMST) | B = two-station
+  fmst:
+    grid_spacing_deg: 0.02
+    smoothing: 50
+    damping: 1.0
+  # Path B has no extra params (uses path-average curves directly).
+
+# -----------------------------------------------------------------------------
+# STAGE 7-alt — DSurfTomo: direct 3-D Vs from noise dispersion (ANT-only check)
+# Independent of the RF+SWD joint inversion; inverts the Stage-6 pair curves
+# straight to a 3-D shear model (Fang et al. 2015). Glue only — needs the
+# compiled Fortran binary. All input formats verified against DSurfTomo source.
+# -----------------------------------------------------------------------------
+dsurftomo:
+  enabled: false                # true to write inputs (+ run if binary set)
+  binary: null                  # path to compiled DSurfTomo; null -> write inputs only
+  measure: phase                # phase | group (Rayleigh)
+  grid_spacing_deg: 0.02        # dvxd = dvzd (lat/lon node spacing)
+  pad_deg: 0.02                 # extend grid this far beyond the array
+  depth_nodes_km: [0, 0.5, 1, 2, 3, 5, 8, 12, 20]   # nz nodes (defines nz)
+  init_minvel: 0.8              # surface Vs of the linear-gradient starting model
+  init_velgrad: 0.15            # Vs increase per km depth (km/s / km)
+  minvel: 0.5                   # a-priori Vs bounds
+  maxvel: 4.5
+  weight: 4.0                   # data weight
+  damp: 1.0                     # regularization damping
+  sublayers: 3                  # depth-kernel sublayers (2~5)
+  maxiter: 10
+  sparsity: 0.2                 # LSMR sparsity fraction
+  noiselevel: 0.02
+  threshold: 3.0                # residual outlier threshold
+  output_dir: dsurftomo
+  timeout_s: 7200
+
+# -----------------------------------------------------------------------------
+# STAGE 8 — joint inversion RF + dispersion
+# -----------------------------------------------------------------------------
+inversion:
+  engine: bayhunter             # bayhunter | rfsurfhmc
+  rf_targets: [local_deep, teleseismic]   # which stacked RFs to feed jointly
+  swd_targets: [phase]          # phase | group | both
+  depth_max: 60                 # km
+  priors:
+    vs: [0.5, 4.8]              # km/s search range
+    n_layers: [3, 12]          # transdimensional (BayHunter); fixed list for rfsurfhmc
+    vpvs: [1.6, 2.0]
+  misfit_sigma: {rf: 0.001, swd: 0.007}   # relative weighting (paper values)
+  mcmc: {chains: 6, iterations: 100000, burnin: 40000}   # BayHunter
+  hmc:  {generations: 200, population: 20, seed: 0}       # RfSurfHmc (if used)
+
+# -----------------------------------------------------------------------------
+# STAGE 9 — synthesis / plotting
+# -----------------------------------------------------------------------------
+plot:
+  # ---- global styling (publication standards) ----
+  dpi: 300
+  format: [png, svg]            # vector + raster; add pdf if needed
+  map_backend: pygmt            # ALL geographic maps (F1,F2,F3,F9) rendered with PyGMT
+  map_projection: M             # PyGMT projection code (Mercator); azimuthal for F2
+  topo_resolution: 03s          # PyGMT relief grid (e.g. 01s,03s,15s) for shaded relief
+  cmap_velocity: roma           # colorblind-safe, perceptually uniform (no jet)
+  vs_clip: [0.5, 4.8]           # shared Vs color range across ALL Vs panels
+  font_family: sans-serif
+  font_size: 9
+  width_cm: {single: 8.3, double: 17.0}   # journal column widths
+  subpanel_labels: true         # a, b, c ...
+  # ---- per-figure toggles (one figure = one switch) ----
+  figures:
+    F1_station_map: true
+    F2_event_distribution: true
+    F3_coverage_raypaths: true
+    F4_hk_panels: true
+    F5_hk_summary: true
+    F6_rf_record_sections: true
+    F7_ccp_sections: true
+    F8_ccf_gather: true
+    F9_dispersion_maps: true    # only meaningful if tomo.path == A
+    F10_inversion_per_station: true
+    F11_vs_cross_sections: true
+    F12_structural_model: true
+  # ---- figure-specific params ----
+  cross_sections: [NS, EW]
+  dispersion_map_periods: [1, 2, 3, 5]    # F9
+  representative_stations: [01A, 05A]      # F4 / F10 example panels
+  overlay: [hk, ccp, inversion]            # interface overlays on F11
+  ccf_bandpass: [0.2, 0.4]                 # Hz, F8 gather
