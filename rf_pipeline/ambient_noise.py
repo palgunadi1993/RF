@@ -16,6 +16,7 @@ from itertools import combinations
 from pathlib import Path
 
 import numpy as np
+from scipy.signal import hilbert
 
 from . import io_utils
 from .logging_setup import get_logger
@@ -104,8 +105,16 @@ def run(cfg: dict) -> Path:
         LOG.warning(f"No continuous data under {scan_dir} — nothing to correlate.")
         return out_dir
 
+    stack_method = str(ant.get("stack_method", "pws")).lower()
+    pws_power = float(ant.get("pws_power", 2.0))
     wlen = int(cc_len * target_sr); wstep = int(cc_step * target_sr)
-    pair_stack: dict[tuple[str, str], np.ndarray] = {}
+
+    # Per pair, accumulate the daily linear stack (lin_sum) and, for phase-weighted
+    # stacking, the complex phase stack (phase_sum = sum over days of exp(i*phi)),
+    # where phi is the instantaneous phase of each daily CCF (Schimmel & Paulssen
+    # 1997). The final PWS = linear_stack * |phase_stack/n|^pws_power.
+    lin_sum: dict[tuple[str, str], np.ndarray] = {}
+    phase_sum: dict[tuple[str, str], np.ndarray] = {}
     pair_n: dict[tuple[str, str], int] = {}
 
     for day in sorted(by_day):
@@ -134,21 +143,30 @@ def run(cfg: dict) -> Path:
                 nn += 1
             if acc is None:
                 continue
-            if key in pair_stack:
-                pair_stack[key] += acc; pair_n[key] += nn
+            daily = acc / nn                      # daily linear stack of windows
+            phase = np.exp(1j * np.angle(hilbert(daily)))
+            if key in lin_sum:
+                lin_sum[key] += daily; phase_sum[key] += phase; pair_n[key] += 1
             else:
-                pair_stack[key] = acc; pair_n[key] = nn
+                lin_sum[key] = daily.copy(); phase_sum[key] = phase; pair_n[key] = 1
         LOG.info(f"[{day}] correlated {len(avail)} stations "
                  f"({len(list(combinations(avail, 2)))} pairs)")
 
     lag = np.arange(-int(maxlag * target_sr), int(maxlag * target_sr) + 1) / target_sr
-    for key, acc in pair_stack.items():
+    for key, lin in lin_sum.items():
         a, b = key
+        n = max(1, pair_n[key])
+        linear = lin / n
+        if stack_method == "pws":
+            coherence = np.abs(phase_sum[key] / n)      # 0..1 phase coherence
+            ccf = linear * coherence ** pws_power
+        else:
+            ccf = linear
         sa, sb = sta_lookup.get(a), sta_lookup.get(b)
         dist = _dist_km(sa, sb) if sa and sb else np.nan
-        np.savez(out_dir / f"{a}_{b}.npz", lag_s=lag, ccf=acc / max(1, pair_n[key]),
-                 n_stack=pair_n[key], dist_km=dist)
-    LOG.info(f"Stage 5 (ANT): {len(pair_stack)} pair CCFs -> {out_dir}")
+        np.savez(out_dir / f"{a}_{b}.npz", lag_s=lag, ccf=ccf,
+                 n_stack=pair_n[key], dist_km=dist, stack_method=stack_method)
+    LOG.info(f"Stage 5 (ANT): {len(lin_sum)} pair CCFs ({stack_method}) -> {out_dir}")
     return out_dir
 
 

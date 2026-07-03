@@ -53,49 +53,50 @@ PLAN-named tool documented as a drop-in alternative:
 
 | Stage | Method (citation) | Named alternative |
 |---|---|---|
-| 3 H-kappa | Zhu & Kanamori (2000) grid stack | `seispy hk` / `rf` |
+| 3 H-kappa | Zhu & Kanamori (2000) grid stack + Appendix-A bottom-up kappa correction | `seispy hk` / `rf` |
 | 4 CCP | 1-D Ps time-to-depth migration + piercing-point stack | `python-seispy` (`ccpprofile.py`) |
-| 5 ANT | Bensen et al. (2007) whitened CC + daily/full stack | NoisePy |
+| 5 ANT | Bensen et al. (2007) whitened CC; phase-weighted stack (Schimmel & Paulssen 1997) | NoisePy |
 | 6 dispersion | FTAN group + phase (Bensen et al. 2007) | `amb_noise_tools` |
-| 7 tomography | two-station average (path B) / FMST export (path A) | FMST (Rawlinson) |
+| 7 tomography | two-station average -> per-station curves | (3-D handled by DSurfTomo below) |
 
-One further external Fortran tool is wired as *glue only* (writes verified input files,
-runs the binary if configured):
+Full 3-D tomography is an external Fortran tool wired as *glue only* (writes verified
+input files, runs the binary if configured) — **it replaces FMST**, which is not
+publicly distributable:
 
 | Stage | Tool used | Input formats verified against | Status |
 |---|---|---|---|
-| 7-alt 3-D ANT | **DSurfTomo** (HongjianFang/DSurfTomo) | `src/main.f90` reader, `GenerateDSurfTomoInputFile.py`, `GenerateIniMOD.py` | wired (needs compiled binary) |
+| 7-alt / path A | **DSurfTomo** (HongjianFang/DSurfTomo) | `src/main.f90` reader, `GenerateDSurfTomoInputFile.py`, `GenerateIniMOD.py` | wired (needs compiled binary) |
 
-These were chosen over blind-wiring the uninstalled tools precisely because a cited,
-inspectable implementation is more verifiable than an unvalidated external call. The
-numerical cores are unit-tested on synthetic data (H-kappa recovers a known
-`H=30 km, Vp/Vs=1.75`; FTAN recovers a known group velocity).
+Cited built-ins were chosen over blind-wiring uninstalled tools because an inspectable
+implementation is more verifiable. Every non-trivial core is unit-tested on synthetics:
+H-kappa recovers a known `H=30 km, Vp/Vs=1.75`; the Appendix-A correction round-trips
+intrinsic Vp/Vs exactly; FTAN recovers a known group velocity; PWS improves S/N over a
+linear stack; DSurfTomo input files match the reference format byte-for-structure.
 
 ## Known limitations / not-yet-wired (honest list)
 
-- **`hk.depth_correct_k`** (paper Appendix A bottom-up recursive kappa correction)
-  is **not** applied; the single-layer stack kappa is reported (logged as a warning).
-- **ANT stacking** is linear; `ant.stack_method: pws` (phase-weighted) is not yet
-  implemented.
-- **Stage 7 path A (FMST)** exports FMST-ready travel-time datasets and, if a binary
-  is configured, expects an external Fortran run; without it, it **falls back to path
-  B** (two-station average) so the inversion still has inputs. Sampling FMST maps back
-  to stations is an external step.
-- **`inversion.engine: rfsurfhmc`** is not wired; use `bayhunter` here, or drive
-  `nqdu/RfSurfHmc` externally from the same exported RF stacks + `tomo/<sta>_disp.txt`.
-- **`inversion.misfit_sigma`** is not force-fed to BayHunter (it estimates noise
-  hierarchically by default).
-- **Real data has not been run** through this yet (external drive not mounted at build
-  time). The code imports cleanly and the numerical cores pass synthetic tests; the
-  `rf`/BayHunter stages need those packages installed (`pip install rf obspyh5`;
-  `git clone .../BayHunter && pip install -e .`) and the drive attached to run.
+- **Full 3-D tomography (`tomo.path: A` / the DSurfTomo stage)** needs the DSurfTomo
+  Fortran binary compiled and set in `dsurftomo.binary` (see Install step 4). Without
+  it, the stage writes the (verified) input files but does not run; the joint inversion
+  still gets its per-station curves from the two-station average.
+- **`inversion.engine: rfsurfhmc`** is not wired; use the default `bayhunter` here, or
+  drive `nqdu/RfSurfHmc` externally from the same exported RF stacks + `tomo/<sta>_disp.txt`.
+  (BayHunter already covers Stage 8; RfSurfHmc is only for exact paper reproduction.)
+- **Real data has not been run** end-to-end yet (external drive not mounted at build
+  time). Code imports cleanly and every numerical core passes synthetic tests; the
+  `rf`/BayHunter stages need those packages installed and the drive attached to run.
+
+Now closed (previously listed here): the Appendix-A depth-dependent kappa correction is
+implemented and unit-tested; ANT phase-weighted stacking (`stack_method: pws`) is
+implemented; `inversion.misfit_sigma` is wired into BayHunter's noise priors; FMST is
+replaced by DSurfTomo.
 
 ## Install
 
 The pipeline is Python 3.11+; several stages need a Fortran/C toolchain. The tools
 split into two kinds, and are installed differently:
 
-- **Standalone binaries** (DSurfTomo, FMST) — compiled once, kept in a shared tools
+- **Standalone binaries** (DSurfTomo) — compiled once, kept in a shared tools
   directory, and **called by absolute path** from `config.yaml`. They are
   env-independent: any project, any conda env, calls the same file.
 - **Python libraries** (`rf`, `BayHunter`, `seispy`, `noisepy`, `amb_noise_tools`) —
@@ -174,12 +175,11 @@ cd /home/kadek/Documents/software
 # 8-alt: RfSurfHmc — the paper's exact joint engine (C + Python; build per its README)
 git clone https://github.com/nqdu/RfSurfHmc
 
-# Drop-in alternatives to the built-in Stages 4-7 (not required):
+# Drop-in alternatives to the built-in Stages 4-6 (not required):
 pip install python-seispy          # Stage 4 CCP / H-kappa
 pip install noisepy-seis           # Stage 5 ANT cross-correlation
 git clone https://github.com/ekaestle/amb_noise_tools && pip install -e ./amb_noise_tools  # Stage 6 FTAN
-# FMST (Stage 7 path A): not on GitHub — obtain Rawlinson's source, compile with gfortran,
-# then set tomo.fmst.binary to the compiled path (same call-by-path pattern as DSurfTomo).
+# (Full 3-D tomography is DSurfTomo from step 4 — FMST is not used.)
 ```
 
 ### 6. Point the config at your data
@@ -200,7 +200,7 @@ Edit the `data:` block in [`config.yaml`](config.yaml) for your machine:
 | Stage 2 (RF), H-kappa on real RFs | + 2 | `dieng_rf` env |
 | Stage 8 (joint inversion) | + 3 | source in `software/`, env `dieng_rf` |
 | Stage 7-alt (DSurfTomo 3-D) | + 4 | binary in `software/`, called by path |
-| Paper-exact engine / FMST maps | + 5 | RfSurfHmc / FMST in `software/` |
+| Paper-exact engine (RfSurfHmc) | + 5 | RfSurfHmc in `software/` |
 
 ## Layout
 

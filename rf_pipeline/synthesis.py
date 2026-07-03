@@ -306,11 +306,31 @@ def F8_ccf_gather(cfg):
 # --------------------------------------------------------------------------
 
 def F9_dispersion_maps(cfg):
-    if str(cfg.get("tomo", {}).get("path", "B")).upper() != "A":
-        LOG.info("F9: tomo.path != A — dispersion maps not applicable, skipping.")
+    """DSurfTomo 3-D Vs horizontal depth slices (replaces the old FMST maps)."""
+    plt = _mpl()
+    p = io_utils.paths(cfg)
+    d_out = io_utils.resolve_path(cfg.get("dsurftomo", {}).get("output_dir", "dsurftomo"),
+                                  cfg["_project_root"])
+    npz = Path(d_out) / "vs3d.npz"
+    if not npz.exists():
+        LOG.info("F9: no DSurfTomo vs3d.npz — run the DSurfTomo stage first, skipping.")
         return
-    LOG.warning("F9: requires FMST velocity maps (tomo/). Skipping until FMST "
-                "maps are produced; see tomography.full_tomography.")
+    d = np.load(npz)
+    lon, lat, depth, vs = d["lon"], d["lat"], d["depth"], d["vs"]
+    slices = cfg.get("plot", {}).get("vs_slice_depths_km", [2, 5, 10, 20])
+    avail = np.unique(depth)
+    slices = [min(avail, key=lambda z: abs(z - s)) for s in slices]
+    clip = cfg.get("plot", {}).get("vs_clip", [0.5, 4.8])
+    fig, axes = plt.subplots(1, len(slices), figsize=(4 * len(slices), 4), squeeze=False)
+    for ax, zt in zip(axes[0], slices):
+        m = np.isclose(depth, zt)
+        sc = ax.scatter(lon[m], lat[m], c=vs[m], cmap=_cmap_velocity(cfg),
+                        vmin=clip[0], vmax=clip[1], s=14, marker="s")
+        ax.set_title(f"Vs @ {zt:g} km"); ax.set_xlabel("Lon"); ax.set_ylabel("Lat")
+        ax.set_aspect("equal")
+        fig.colorbar(sc, ax=ax, label="Vs (km/s)")
+    fig.tight_layout()
+    _save(fig, "F9_vs_depth_slices", cfg)
 
 
 # --------------------------------------------------------------------------

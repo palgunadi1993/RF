@@ -115,8 +115,15 @@ hk:
   k_range:  [1.6, 2.5]
   k_step:   0.05
   weights:  [0.6, 0.3, 0.1]     # Ps, PpPs, PsPs amplitude weights
+  run_on: [local_deep, teleseismic]   # order shallow->deep for the depth correction
   depth_correct_k: true         # bottom-up recursive k correction (paper App. A)
-  run_on: [teleseismic, local_deep]
+  # correction_layers: one {vp, thick_km} per class in run_on (shallow->deep). The
+  # per-class cumulative kappa become the measured profile kmeas_i; App. A recovers
+  # intrinsic per-layer Vp/Vs -> hk_corrected.csv. Needs >=2 classes; leave unset to
+  # report raw (uncorrected) kappa.
+  correction_layers:
+    - {vp: 5.0, thick_km: 8.0}    # shallow layer (local_deep)
+    - {vp: 6.4, thick_km: 22.0}   # deeper layer (teleseismic)
 
 # -----------------------------------------------------------------------------
 # STAGE 4 — CCP migration (seispy)
@@ -142,7 +149,9 @@ ant:
   freqmax: 5.0
   maxlag: 100                   # s
   components: ZZ                # Rayleigh
-  stack_method: pws             # phase-weighted stack of all days
+  stack_method: pws             # pws (phase-weighted, Schimmel & Paulssen 1997) | linear
+  pws_power: 2.0                # nu exponent on the phase-coherence weight (pws only)
+  target_sampling_rate: 20      # Hz, downsample before correlation
 
 # -----------------------------------------------------------------------------
 # STAGE 6 — dispersion measurement (amb_noise_tools, FTAN)
@@ -157,12 +166,10 @@ dispersion:
 # STAGE 7 — dispersion -> per-station curve
 # -----------------------------------------------------------------------------
 tomo:
-  path: A                       # A = full tomography (FMST) | B = two-station
-  fmst:
-    grid_spacing_deg: 0.02
-    smoothing: 50
-    damping: 1.0
-  # Path B has no extra params (uses path-average curves directly).
+  # Always writes per-station curves for the joint inversion (two-station average).
+  # path: A  -> also run full 3-D tomography via the DSurfTomo stage below
+  # path: B  -> per-station curves only
+  path: A
 
 # -----------------------------------------------------------------------------
 # STAGE 7-alt — DSurfTomo: direct 3-D Vs from noise dispersion (ANT-only check)

@@ -1,14 +1,14 @@
 """Stage 7: from pair dispersion to one 1-D curve per station (PLAN.md Stage 7).
 
-Path B (two-station / small-array, default & self-contained): for each station,
-average every pair curve that involves it into a representative per-station
-dispersion curve.
+This stage produces the per-station dispersion curves the joint inversion (Stage 8)
+consumes, by two-station averaging: for each station, average every pair curve that
+involves it into one representative dispersion curve.
 
-Path A (full 2-D tomography with FMST): export the per-period travel-time datasets
-FMST expects, invoke the configured FMST binary, then sample each period's phase-
-velocity map at the station locations. If the binary is not configured/available
-the stage logs a warning and falls back to Path B so it always produces per-station
-curves for the inversion.
+Full 3-D tomography is handled by the separate **DSurfTomo** stage
+(``rf_pipeline.dsurftomo``, ``run_dsurftomo.py``) — it inverts the same pair curves
+directly for a 3-D Vs model. When ``tomo.path: A`` (the "also do full tomography"
+setting), this stage additionally triggers that DSurfTomo run. There is no FMST path
+(Rawlinson's FMST is not publicly distributable); DSurfTomo replaces it.
 
 Output: tomo/<station>_disp.txt  (period phase_vel [group_vel] sigma).
 """
@@ -79,62 +79,21 @@ def two_station(cfg: dict) -> Path:
     return out_dir
 
 
-def _export_fmst_inputs(cfg, curves, stations, out_dir) -> Path:
-    """Write FMST-style per-period travel-time datasets (sources/receivers/times)."""
-    fmst_dir = io_utils.ensure_dir(out_dir / "fmst_inputs")
-    sta_lookup = io_utils.station_lookup(stations)
-    periods = sorted({round(float(T), 4)
-                      for arr in curves.values() for T in arr[:, 0]})
-    for T in periods:
-        lines = []
-        for (a, b), arr in curves.items():
-            sa, sb = sta_lookup.get(a), sta_lookup.get(b)
-            if sa is None or sb is None:
-                continue
-            match = arr[np.isclose(arr[:, 0], T)]
-            if match.size == 0:
-                continue
-            c = float(match[0, 1])
-            from obspy.geodetics import gps2dist_azimuth
-            dist, _, _ = gps2dist_azimuth(sa.latitude, sa.longitude,
-                                          sb.latitude, sb.longitude)
-            tt = (dist / 1000.0) / c
-            lines.append(f"{sa.latitude:.5f} {sa.longitude:.5f} "
-                         f"{sb.latitude:.5f} {sb.longitude:.5f} {tt:.5f} {c:.4f}")
-        (fmst_dir / f"tt_{T:.2f}s.dat").write_text("\n".join(lines) + "\n")
-    LOG.info(f"FMST inputs exported for {len(periods)} periods -> {fmst_dir}")
-    return fmst_dir
-
-
-def full_tomography(cfg: dict) -> Path:
-    p = io_utils.paths(cfg)
-    out_dir = io_utils.ensure_dir(p["tomo"])
-    stations, _ = io_utils.load_stations(cfg)
-    curves = _load_pair_curves(p["disp"])
-    if not curves:
-        LOG.warning("No pair curves — cannot run tomography.")
-        return out_dir
-
-    _export_fmst_inputs(cfg, curves, stations, out_dir)
-    binary = cfg.get("tomo", {}).get("fmst", {}).get("binary")
-    if binary:
-        binary = io_utils.resolve_path(binary, cfg["_project_root"])
-    if not binary or not Path(binary).exists():
-        LOG.warning("tomo.path=A but no FMST binary configured/available. "
-                    "FMST inputs were exported to tomo/fmst_inputs/; run FMST "
-                    "externally, or use path B. Falling back to path B now.")
-        return two_station(cfg)
-
-    # If a binary is present, the FMST run would be driven here (external Fortran).
-    LOG.info(f"FMST binary {binary} present — drive it over tomo/fmst_inputs/, "
-             "then sample maps at station locations. (External step.)")
-    # After an external FMST run the maps should be sampled; until then provide
-    # the two-station curves so the inversion still has inputs.
-    return two_station(cfg)
-
-
 def run(cfg: dict) -> Path:
+    """Produce per-station curves (always); if path A, also run DSurfTomo for 3-D.
+
+    The joint inversion needs the two-station per-station curves regardless, so
+    they are always written. ``tomo.path: A`` additionally launches the DSurfTomo
+    3-D inversion (which replaces the old FMST full-tomography path).
+    """
+    out_dir = two_station(cfg)
     path = str(cfg.get("tomo", {}).get("path", "B")).upper()
     if path == "A":
-        return full_tomography(cfg)
-    return two_station(cfg)
+        from . import dsurftomo
+        LOG.info("tomo.path=A -> full 3-D tomography via DSurfTomo.")
+        # honour path A even if dsurftomo.enabled wasn't set explicitly
+        cfg.setdefault("dsurftomo", {})
+        if not cfg["dsurftomo"].get("enabled"):
+            cfg["dsurftomo"] = {**cfg["dsurftomo"], "enabled": True}
+        dsurftomo.run(cfg)
+    return out_dir

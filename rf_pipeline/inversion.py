@@ -146,6 +146,16 @@ def invert_station(cfg, station, rf_cfg, out_root) -> Path | None:
         "layers": tuple(pri.get("n_layers", [3, 12])),
         "vpvs": vpvs_prior,
     }
+    # Weighting: fix BayHunter's data-noise sigma to the paper's guide values so the
+    # RF-vs-SWD balance matches (likelihood ~ 1/sigma^2). BayHunter samples noise in
+    # [min,max]; min==max fixes it. Verified keys: rfnoise_sigma / swdnoise_sigma
+    # (BayHunter defaults.ini [modelpriors]). Drop misfit_sigma to let it estimate
+    # noise hierarchically instead.
+    sigma = inv_cfg.get("misfit_sigma") or {}
+    if "rf" in sigma:
+        priors["rfnoise_sigma"] = (float(sigma["rf"]), float(sigma["rf"]))
+    if "swd" in sigma:
+        priors["swdnoise_sigma"] = (float(sigma["swd"]), float(sigma["swd"]))
     mcmc = inv_cfg.get("mcmc", {})
     station_dir = io_utils.ensure_dir(out_root / station)
     initparams = {
