@@ -82,6 +82,52 @@ def _fetch_class(name: str, spec: dict, window, centroid, out_path: Path):
     return cat
 
 
+def _depth_bounds_km(spec: dict) -> tuple[float | None, float | None]:
+    """Depth bounds (km) that define the class, from its ``fetch`` block."""
+    fetch = spec.get("fetch", {}) or {}
+    lo = fetch.get("min_depth_km")
+    hi = fetch.get("max_depth_km")
+    return (None if lo is None else float(lo),
+            None if hi is None else float(hi))
+
+
+def _event_depth_km(ev) -> float | None:
+    try:
+        origin = ev.preferred_origin() or ev.origins[0]
+    except (AttributeError, IndexError):
+        return None
+    if origin is None or origin.depth is None:
+        return None
+    return float(origin.depth) / 1000.0  # QuakeML stores depth in metres
+
+
+def filter_by_class_depth(cat, name: str, spec: dict):
+    """Drop events outside the class's depth bounds (``fetch.min/max_depth_km``).
+
+    A fetched catalog already satisfies these, but a user-supplied QuakeML may
+    not — and Stage 2 gates only on distance and slowness, so e.g. a shallow
+    local event would otherwise be processed as local-deep. Events without a
+    depth are dropped too: class membership cannot be confirmed.
+    """
+    lo, hi = _depth_bounds_km(spec)
+    if lo is None and hi is None:
+        return cat
+    kept, n_out, n_nodepth = [], 0, 0
+    for ev in cat:
+        z = _event_depth_km(ev)
+        if z is None:
+            n_nodepth += 1
+        elif (lo is not None and z < lo) or (hi is not None and z > hi):
+            n_out += 1
+        else:
+            kept.append(ev)
+    if n_out or n_nodepth:
+        LOG.warning(f"[{name}] depth filter ({lo}-{hi} km): dropped {n_out} "
+                    f"out-of-range and {n_nodepth} depth-less of {len(cat)} events.")
+    cat.events = kept
+    return cat
+
+
 def build_catalog(cfg: dict, name: str, spec: dict, window, centroid) -> Path | None:
     """Resolve one class to a QuakeML path (local file preferred, else fetch)."""
     if not spec.get("enabled", True):
@@ -133,4 +179,4 @@ def load_class_catalog(cfg: dict, name: str):
     if not Path(path).exists():
         LOG.warning(f"[{name}] catalog not found at {path}")
         return None
-    return io_utils.load_catalog(path)
+    return filter_by_class_depth(io_utils.load_catalog(path), name, spec)

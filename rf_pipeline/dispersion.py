@@ -18,7 +18,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import io_utils
+from . import io_utils, parallel
 from .logging_setup import get_logger
 
 LOG = get_logger("rf.dispersion")
@@ -36,8 +36,61 @@ def _ref_curve(cfg) -> np.ndarray:
     return arr[np.argsort(arr[:, 0])]
 
 
-def run(cfg: dict) -> Path:
+def _pick_pair(cfg: dict, f: Path, out_dir: Path, prm: dict) -> bool:
+    """Pick + resample ONE pair's dispersion curve: the parallel work unit.
+
+    Reads one Stage-5 .npz, writes one .disp — no shared state. Returns True
+    if a curve was written.
+    """
     noise = io_utils.import_amb_noise_tools(cfg)
+
+    d = np.load(f)
+    if "corr_spectrum" not in d or "freq" not in d:
+        LOG.warning(f"{f.name}: not an amb_noise_tools CC spectrum — re-run Stage 5.")
+        return False
+    dist = float(d["dist_km"]) if "dist_km" in d else np.nan
+    if not np.isfinite(dist) or dist <= 0:
+        return False
+    freq, spectrum = d["freq"], d["corr_spectrum"]
+    try:
+        smoothed = noise.velocity_filter(freq, spectrum, dist,
+                                         velband=prm["velband"])
+        crossings, phase_vel = noise.get_smooth_pv(
+            freq, smoothed, dist, prm["ref"],
+            freqmin=prm["freqmin"], freqmax=prm["freqmax"],
+            min_vel=prm["min_vel"], max_vel=prm["max_vel"],
+            horizontal_polarization=False,
+            smooth_spectrum=False, plotting=False)
+    except Exception as e:
+        LOG.debug(f"{f.stem}: get_smooth_pv failed ({e})")
+        return False
+    phase_vel = np.asarray(phase_vel)
+    if phase_vel.ndim != 2 or phase_vel.shape[0] < 2:
+        return False
+    pv_freq, pv_c = phase_vel[:, 0], phase_vel[:, 1]
+    order = np.argsort(pv_freq)
+    pv_freq, pv_c = pv_freq[order], pv_c[order]
+
+    rows = []
+    for T in prm["periods"]:
+        fq = 1.0 / T
+        if fq < pv_freq.min() or fq > pv_freq.max():
+            continue
+        c = float(np.interp(fq, pv_freq, pv_c))
+        if not (prm["min_vel"] <= c <= prm["max_vel"]):
+            continue
+        if dist < prm["min_wl"] * c * T:                   # min-wavelength gate
+            continue
+        rows.append((T, c, np.nan, 0.05 * c))              # group=NaN, sigma~5%
+    if not rows:
+        return False
+    np.savetxt(out_dir / f"{f.stem}.disp", np.array(rows), fmt="%.4f",
+               header="period_s phase_vel group_vel sigma")
+    return True
+
+
+def run(cfg: dict) -> Path:
+    io_utils.import_amb_noise_tools(cfg)   # fail fast if the picker is missing
 
     disp = cfg.get("dispersion", {})
     periods = np.array(disp.get("periods", [0.5, 1, 2, 3, 4, 5, 6, 8]), dtype=float)
@@ -58,47 +111,13 @@ def run(cfg: dict) -> Path:
         LOG.warning(f"No CCFs under {p['ccfs']} — run Stage 5 first.")
         return out_dir
 
-    n_written = 0
-    for f in ccfs:
-        d = np.load(f)
-        if "corr_spectrum" not in d or "freq" not in d:
-            LOG.warning(f"{f.name}: not an amb_noise_tools CC spectrum — re-run Stage 5.")
-            continue
-        dist = float(d["dist_km"]) if "dist_km" in d else np.nan
-        if not np.isfinite(dist) or dist <= 0:
-            continue
-        freq, spectrum = d["freq"], d["corr_spectrum"]
-        try:
-            smoothed = noise.velocity_filter(freq, spectrum, dist, velband=velband)
-            crossings, phase_vel = noise.get_smooth_pv(
-                freq, smoothed, dist, ref, freqmin=freqmin, freqmax=freqmax,
-                min_vel=min_vel, max_vel=max_vel, horizontal_polarization=False,
-                smooth_spectrum=False, plotting=False)
-        except Exception as e:
-            LOG.debug(f"{f.stem}: get_smooth_pv failed ({e})")
-            continue
-        phase_vel = np.asarray(phase_vel)
-        if phase_vel.ndim != 2 or phase_vel.shape[0] < 2:
-            continue
-        pv_freq, pv_c = phase_vel[:, 0], phase_vel[:, 1]
-        order = np.argsort(pv_freq)
-        pv_freq, pv_c = pv_freq[order], pv_c[order]
-
-        rows = []
-        for T in periods:
-            fq = 1.0 / T
-            if fq < pv_freq.min() or fq > pv_freq.max():
-                continue
-            c = float(np.interp(fq, pv_freq, pv_c))
-            if not (min_vel <= c <= max_vel):
-                continue
-            if dist < min_wl * c * T:                      # min-wavelength gate
-                continue
-            rows.append((T, c, np.nan, 0.05 * c))          # group=NaN, sigma~5%
-        if rows:
-            np.savetxt(out_dir / f"{f.stem}.disp", np.array(rows), fmt="%.4f",
-                       header="period_s phase_vel group_vel sigma")
-            n_written += 1
+    prm = {"periods": periods, "min_vel": min_vel, "max_vel": max_vel,
+           "velband": velband, "min_wl": min_wl, "ref": ref,
+           "freqmin": freqmin, "freqmax": freqmax}
+    n_jobs = parallel.resolve_n_jobs(cfg, n_tasks=len(ccfs))
+    tasks = [(cfg, f, out_dir, prm) for f in ccfs]
+    results = parallel.pmap(_pick_pair, tasks, n_jobs, desc="dispersion")
+    n_written = sum(1 for r in results if r)
     LOG.info(f"Stage 6 (dispersion via amb_noise_tools): {n_written}/{len(ccfs)} "
              f"pair curves -> {out_dir}")
     return out_dir

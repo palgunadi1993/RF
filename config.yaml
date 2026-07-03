@@ -24,6 +24,11 @@ project:
     inversion:    inversion
     figures:      figures
   log_level: INFO
+  # Parallel worker processes (multiprocessing, single machine). -1 = all cores.
+  # Used by Stage 2 (per station), Stage 5 (per day), Stage 6 (per pair); Stage 8
+  # runs n_jobs // inversion.mcmc.chains stations at once (BayHunter already
+  # parallelizes its chains). Set 1 to force the old fully-serial behaviour.
+  n_jobs: -1
 
 # -----------------------------------------------------------------------------
 # STAGE 1 — data / event catalogs (one block per source class; all three used)
@@ -67,6 +72,8 @@ catalogs:
   local_deep:
     enabled: true
     file: data/catalogs/local_deep.xml      # Java slab Wadati–Benioff events
+    # min/max_depth_km also act as a load-time filter on a user-supplied file,
+    # so shallow events in a mixed local catalog cannot leak into this class.
     fetch:
       provider: ISC
       max_distance_deg: 5

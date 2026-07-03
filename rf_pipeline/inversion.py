@@ -21,7 +21,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from . import io_utils
+from . import io_utils, parallel
 from .logging_setup import get_logger
 
 LOG = get_logger("rf.inversion")
@@ -235,6 +235,13 @@ def _export_posterior(cfg, station_dir: Path, station: str) -> None:
         LOG.debug(f"{station}: BayHunter plots skipped ({e!r}).")
 
 
+def _invert_station_task(cfg, station, rf_cfg, out_root_str):
+    """Per-station work unit for pmap: re-apply the np.float shim (a spawned
+    worker starts with a fresh numpy) before running the inversion."""
+    _require_bayhunter()
+    return invert_station(cfg, station, rf_cfg, Path(out_root_str))
+
+
 def run(cfg: dict) -> Path:
     engine = str(cfg.get("inversion", {}).get("engine", "bayhunter")).lower()
     p = io_utils.paths(cfg)
@@ -249,9 +256,19 @@ def run(cfg: dict) -> Path:
     stations, _ = io_utils.load_stations(cfg)
     rf_cfg = cfg.get("rf", {})
     only = cfg.get("inversion", {}).get("stations")  # optional subset
-    for sta in stations:
-        if only and sta.code not in only:
-            continue
-        invert_station(cfg, sta.code, rf_cfg, out_root)
+    tasks = [(cfg, sta.code, rf_cfg, str(out_root))
+             for sta in stations if not only or sta.code in only]
+
+    # BayHunter already runs its chains as parallel processes (mp_inversion
+    # with nthreads=nchains), so the station-level width is what is left of
+    # the n_jobs core target after each station's own chains are accounted
+    # for — running n_jobs stations x nchains chains would oversubscribe.
+    nchains = int(cfg.get("inversion", {}).get("mcmc", {}).get("chains", 6))
+    n_jobs = parallel.resolve_n_jobs(cfg, n_tasks=len(tasks))
+    workers = max(1, n_jobs // max(1, nchains))
+    if workers > 1:
+        LOG.info(f"Stage 8: {workers} stations concurrently "
+                 f"x {nchains} BayHunter chains each")
+    parallel.pmap(_invert_station_task, tasks, workers, desc="inversion")
     LOG.info("Stage 8 (joint inversion) complete.")
     return out_root

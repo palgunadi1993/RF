@@ -23,7 +23,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import io_utils
+from . import io_utils, parallel
 from .logging_setup import get_logger
 
 LOG = get_logger("rf.ambient_noise")
@@ -53,8 +53,44 @@ def _preprocess_z(tr, sr, inv, resp_out, pre_filt):
     return tr
 
 
+def _day_task(cfg: dict, day, wfs, sta_lookup, inv, prm: dict):
+    """Correlate all station pairs of ONE day: the parallel work unit.
+
+    Days are independent (each reads only its own files); the parent reduces
+    the returned per-pair daily spectra into the running stacks in day order.
+    Returns ``(n_stations, {(a, b): (freq, spectrum, nwins)})``.
+    """
+    noise = io_utils.import_amb_noise_tools(cfg)
+
+    zt = {}
+    for wf in wfs:
+        sta = sta_lookup.get(wf.station)
+        try:
+            st = io_utils.read_day_3c(wf, sta)
+        except Exception:
+            continue
+        zsel = st.select(component="Z")
+        if len(zsel):
+            zt[wf.station] = _preprocess_z(zsel[0], prm["target_sr"], inv,
+                                           prm["resp_out"], prm["pre_filt"])
+    out = {}
+    for a, b in combinations(sorted(zt), 2):
+        try:
+            # noisecorr takes two Traces and cuts them to the common time
+            # range internally (calls adapt_timespan), so pass Z directly.
+            freq, spectrum, nwins = noise.noisecorr(
+                zt[a], zt[b], window_length=prm["cc_len"], overlap=prm["overlap"],
+                onebit=prm["onebit"], whiten=prm["whiten"],
+                water_level=prm["water_level"])
+        except Exception as e:
+            LOG.debug(f"[{day}] {a}-{b}: noisecorr failed ({e})")
+            continue
+        out[(a, b)] = (freq, spectrum, max(1, int(nwins)))
+    return len(zt), out
+
+
 def run(cfg: dict) -> Path:
-    noise = io_utils.import_amb_noise_tools(cfg)   # validated CC/dispersion core
+    io_utils.import_amb_noise_tools(cfg)   # fail fast if the CC core is missing
 
     ant = cfg.get("ant", {})
     sr = float(cfg.get("data", {}).get("sampling_rate", 100.0))
@@ -91,30 +127,10 @@ def run(cfg: dict) -> Path:
     ndays: dict[tuple[str, str], int] = {}
     nwins_sum: dict[tuple[str, str], int] = {}
 
-    for day in sorted(by_day):
-        zt = {}
-        for wf in by_day[day]:
-            sta = sta_lookup.get(wf.station)
-            try:
-                st = io_utils.read_day_3c(wf, sta)
-            except Exception:
-                continue
-            zsel = st.select(component="Z")
-            if len(zsel):
-                zt[wf.station] = _preprocess_z(zsel[0], target_sr, inv, resp_out, pre_filt)
-        avail = sorted(zt)
-        for a, b in combinations(avail, 2):
-            key = (a, b)
-            try:
-                # noisecorr takes two Traces and cuts them to the common time
-                # range internally (calls adapt_timespan), so pass Z directly.
-                freq, spectrum, nwins = noise.noisecorr(
-                    zt[a], zt[b], window_length=cc_len, overlap=overlap,
-                    onebit=onebit, whiten=whiten, water_level=water_level)
-            except Exception as e:
-                LOG.debug(f"[{day}] {a}-{b}: noisecorr failed ({e})")
-                continue
-            nw = max(1, int(nwins))
+    def _fold(day, n_sta, day_spectra):
+        """Reduce one day's spectra into the running per-pair stacks."""
+        for key, (freq, spectrum, nw) in day_spectra.items():
+            a, b = key
             if key not in spec_sum:
                 spec_sum[key] = spectrum.astype(complex) * nw
                 freq_axis[key] = freq
@@ -128,10 +144,35 @@ def run(cfg: dict) -> Path:
                 # never RESET an accumulated stack on a stray malformed day
                 LOG.warning(f"[{day}] {a}-{b}: spectrum shape {spectrum.shape} != "
                             f"stack {spec_sum[key].shape} — day skipped.")
-                continue
-        LOG.info(f"[{day}] correlated {len(avail)} stations "
-                 f"({len(list(combinations(avail, 2)))} pairs)")
+        LOG.info(f"[{day}] correlated {n_sta} stations ({len(day_spectra)} pairs)")
 
+    prm = {"target_sr": target_sr, "resp_out": resp_out, "pre_filt": pre_filt,
+           "cc_len": cc_len, "overlap": overlap, "onebit": onebit,
+           "whiten": whiten, "water_level": water_level}
+    days = sorted(by_day)
+    n_jobs = parallel.resolve_n_jobs(cfg, n_tasks=len(days))
+    if n_jobs <= 1:
+        for day in days:
+            n_sta, day_spectra = _day_task(cfg, day, by_day[day], sta_lookup, inv, prm)
+            _fold(day, n_sta, day_spectra)
+    else:
+        # Fold in day order, releasing each result as it is consumed, so the
+        # whole deployment's daily spectra are never all held in memory.
+        LOG.info(f"ANT day correlation: {len(days)} days on {n_jobs} processes")
+        with parallel.executor(n_jobs) as ex:
+            futures = [ex.submit(_day_task, cfg, day, by_day[day],
+                                 sta_lookup, inv, prm) for day in days]
+            for i, day in enumerate(days):
+                try:
+                    n_sta, day_spectra = futures[i].result()
+                except Exception as e:
+                    LOG.warning(f"[{day}] correlation failed in worker ({e!r})")
+                    continue
+                finally:
+                    futures[i] = None
+                _fold(day, n_sta, day_spectra)
+
+    noise = io_utils.import_amb_noise_tools(cfg)
     for key, ssum in spec_sum.items():
         a, b = key
         spectrum = ssum / max(1, nwins_sum[key])      # window-weighted mean CC spectrum
