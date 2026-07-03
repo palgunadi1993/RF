@@ -33,6 +33,14 @@ def load_config(path: str | Path) -> dict:
     cfg["_config_path"] = str(cfg_path)
     root = cfg.get("project", {}).get("root")
     cfg["_project_root"] = str(Path(root).expanduser().resolve()) if root else str(cfg_path.parent)
+    # honour project.log_level for every rf.* logger created by get_logger
+    level = str(cfg.get("project", {}).get("log_level", "")).upper()
+    if level:
+        import logging
+        logging.getLogger("rf").setLevel(getattr(logging, level, logging.INFO))
+        for lg in logging.Logger.manager.loggerDict:
+            if lg.startswith("rf."):
+                logging.getLogger(lg).setLevel(getattr(logging, level, logging.INFO))
     return cfg
 
 

@@ -29,6 +29,9 @@ from .logging_setup import get_logger
 LOG = get_logger("rf.ambient_noise")
 
 
+_RESP_WARNED: set[str] = set()
+
+
 def _preprocess_z(tr, sr, inv, resp_out, pre_filt):
     """Detrend, (optionally) remove response, resample. Whitening/one-bit are left
     to noise.noisecorr, so we do NOT normalize the spectrum here."""
@@ -38,8 +41,13 @@ def _preprocess_z(tr, sr, inv, resp_out, pre_filt):
         try:
             tr.remove_response(inventory=inv, output=resp_out, pre_filt=pre_filt,
                                water_level=60)
-        except Exception:
-            pass
+        except Exception as e:
+            # An uncorrected instrument PHASE response biases inter-station
+            # phase velocities — never swallow this silently.
+            if tr.id not in _RESP_WARNED:
+                _RESP_WARNED.add(tr.id)
+                LOG.warning(f"response removal failed for {tr.id} ({e}); "
+                            f"trace used WITHOUT response correction.")
     if abs(tr.stats.sampling_rate - sr) > 1e-6:
         tr.resample(sr)
     return tr
@@ -77,10 +85,11 @@ def run(cfg: dict) -> Path:
         LOG.warning(f"No continuous data under {scan_dir} — nothing to correlate.")
         return out_dir
 
-    # per pair: sum of daily CC spectra + freq axis + day count
+    # per pair: window-count-weighted sum of daily CC spectra + freq axis + counts
     spec_sum: dict[tuple[str, str], np.ndarray] = {}
     freq_axis: dict[tuple[str, str], np.ndarray] = {}
     ndays: dict[tuple[str, str], int] = {}
+    nwins_sum: dict[tuple[str, str], int] = {}
 
     for day in sorted(by_day):
         zt = {}
@@ -105,17 +114,27 @@ def run(cfg: dict) -> Path:
             except Exception as e:
                 LOG.debug(f"[{day}] {a}-{b}: noisecorr failed ({e})")
                 continue
-            if key in spec_sum and spec_sum[key].shape == spectrum.shape:
-                spec_sum[key] += spectrum; ndays[key] += 1
+            nw = max(1, int(nwins))
+            if key not in spec_sum:
+                spec_sum[key] = spectrum.astype(complex) * nw
+                freq_axis[key] = freq
+                ndays[key] = 1; nwins_sum[key] = nw
+            elif spec_sum[key].shape == spectrum.shape:
+                # weight each day by its surviving window count -> true
+                # all-window average, not day-mean-of-means
+                spec_sum[key] += spectrum * nw
+                ndays[key] += 1; nwins_sum[key] += nw
             else:
-                spec_sum[key] = spectrum.astype(complex); freq_axis[key] = freq
-                ndays[key] = 1
+                # never RESET an accumulated stack on a stray malformed day
+                LOG.warning(f"[{day}] {a}-{b}: spectrum shape {spectrum.shape} != "
+                            f"stack {spec_sum[key].shape} — day skipped.")
+                continue
         LOG.info(f"[{day}] correlated {len(avail)} stations "
                  f"({len(list(combinations(avail, 2)))} pairs)")
 
     for key, ssum in spec_sum.items():
         a, b = key
-        spectrum = ssum / max(1, ndays[key])          # mean daily CC spectrum
+        spectrum = ssum / max(1, nwins_sum[key])      # window-weighted mean CC spectrum
         freq = freq_axis[key]
         sa, sb = sta_lookup.get(a), sta_lookup.get(b)
         dist = _dist_km(sa, sb) if sa and sb else np.nan

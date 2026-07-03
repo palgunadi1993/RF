@@ -260,7 +260,9 @@ def F7_ccp_sections(cfg):
     fig, axes = plt.subplots(len(npzs), 1, figsize=(9, 4 * len(npzs)), squeeze=False)
     for ax, f in zip(axes[:, 0], npzs):
         d = np.load(f)
-        vmax = np.nanpercentile(np.abs(d["amp"]), 98) or 1.0
+        vmax = np.nanpercentile(np.abs(d["amp"]), 98)
+        if not np.isfinite(vmax) or vmax <= 0:  # `or` would keep NaN (truthy)
+            vmax = 1.0
         im = ax.pcolormesh(d["along"], d["depth"], d["amp"].T, cmap="RdBu_r",
                            vmin=-vmax, vmax=vmax, shading="auto")
         ax.invert_yaxis(); ax.set_ylabel("Depth (km)")
@@ -344,9 +346,11 @@ def F10_inversion_per_station(cfg):
     found = [Path(inv_dir) / s for s in reps if inv_dir and (Path(inv_dir) / s).exists()]
     if not found:
         LOG.warning("F10: no per-station inversion output — skipping "
-                    "(BayHunter writes its own best_model/fit plots per station).")
+                    "(run Stage 8; it exports vs_profile.txt and BayHunter's "
+                    "posterior figures per station).")
         return
-    LOG.info(f"F10: BayHunter per-station plots live under {[str(f) for f in found]}.")
+    LOG.info(f"F10: per-station inversion outputs live under "
+             f"{[str(f) for f in found]}.")
 
 
 # --------------------------------------------------------------------------

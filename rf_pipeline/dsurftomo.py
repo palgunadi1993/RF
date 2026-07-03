@@ -167,7 +167,7 @@ def run(cfg: dict) -> Path:
 
     measure = str(d.get("measure", "phase")).lower()
     veltype = 0 if measure == "phase" else 1
-    col = 1 if measure == "phase" else 2      # .disp columns: period phase group snr
+    col = 1 if measure == "phase" else 2      # .disp columns: period phase group sigma
 
     periods = _period_list(disp_dir, d.get("periods") or cfg.get("dispersion", {}).get("periods"))
     if not periods:

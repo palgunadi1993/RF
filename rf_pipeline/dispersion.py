@@ -43,7 +43,9 @@ def run(cfg: dict) -> Path:
     periods = np.array(disp.get("periods", [0.5, 1, 2, 3, 4, 5, 6, 8]), dtype=float)
     min_vel = float(disp.get("min_vel", 1.5))
     max_vel = float(disp.get("max_vel", 5.0))
-    velband = tuple(disp.get("velband", [max_vel, max_vel - 0.5, min_vel, min_vel - 0.4]))
+    # outer taper corners must stay positive even for small min_vel
+    velband = tuple(disp.get("velband", [max_vel, max_vel - 0.5, min_vel,
+                                         max(0.1, min_vel - 0.4)]))
     min_wl = float(disp.get("min_wavelengths", 2))
     ref = _ref_curve(cfg)
     freqmin = float(disp.get("freqmin", 1.0 / periods.max()))

@@ -123,8 +123,10 @@ from rf import read_rf, RFStream
 > model** (ObsPy TauPy or pyrocko `cake`) rather than the global default — this is the only
 > source-class-specific subtlety in `rf`.
 
-**Deconvolution:** iterative **time-domain** (paper's choice: `f1=0.03, f2=20,
-max_iters=400, gauss width=1.0`). Water-level is the fallback.
+**Deconvolution:** iterative **time-domain** (Ligorria & Ammon 1999; `f1=0.03,
+f2=20, max_iters=400`) is this pipeline's default, chosen for the 5 Hz nodes.
+NOTE the paper itself used **water-level** deconvolution (Gaussian `a=0.5`,
+water level `c=0.1`, band 0.01–2 Hz) — set `deconvolve: freqattr` to match it.
 
 **Outputs:** `rf_out/<station>_<class>.h5` (individual RFs) + `rf_out/<station>_<class>_stack.sac`
 (the stacked radial RF used later by the inversion).

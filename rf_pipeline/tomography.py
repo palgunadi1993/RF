@@ -67,7 +67,10 @@ def two_station(cfg: dict) -> Path:
         for T in sorted(data):
             vals = np.array(data[T], dtype=float)
             phase = np.nanmean(vals[:, 0])
-            group = np.nanmean(vals[:, 1])
+            # group column is structurally NaN (get_smooth_pv picks phase only);
+            # avoid numpy's mean-of-empty-slice warning on the all-NaN column.
+            gcol = vals[:, 1]
+            group = np.nanmean(gcol) if np.isfinite(gcol).any() else np.nan
             sigma = np.nanstd(vals[:, 0]) if len(vals) > 1 else 0.05 * phase
             rows.append((T, phase, group, max(sigma, 0.01)))
         if rows:

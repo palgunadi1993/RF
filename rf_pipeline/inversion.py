@@ -10,7 +10,9 @@ posterior Vs(z) with uncertainty. Priors come from the config; the Vp/Vs prior i
 informed by the Stage-3 H-kappa result when available. ``rfsurfhmc`` is offered as
 the paper-reproduction alternative (same inputs).
 
-Output: inversion/<station>/ — BayHunter storage, posterior models and fits.
+Output: inversion/<station>/ — BayHunter chain storage (data/c*_p2*.npy), the
+aggregated posterior median profile ``vs_profile.txt`` (read by figure F11),
+and BayHunter's own posterior figures when its plotting succeeds.
 """
 from __future__ import annotations
 
@@ -26,6 +28,11 @@ LOG = get_logger("rf.inversion")
 
 
 def _require_bayhunter():
+    # BayHunter 2.1 still uses np.float (SingleChain.py), removed in numpy>=1.24;
+    # without this shim MCMC_Optimizer construction raises AttributeError on
+    # every station. Restore it as the plain builtin alias it used to be.
+    if not hasattr(np, "float"):
+        np.float = float  # type: ignore[attr-defined]
     try:
         from BayHunter import Targets, MCMC_Optimizer  # noqa: F401
         import BayHunter  # noqa: F401
@@ -108,11 +115,15 @@ def _build_targets(cfg, station, rf_cfg):
         arr = np.loadtxt(disp_file, ndmin=2)
         if arr.size:
             periods, phase, group = arr[:, 0], arr[:, 1], arr[:, 2]
+            # col 3 (per-period sigma from the pair scatter) -> BayHunter yerr
+            yerr = arr[:, 3] if arr.shape[1] > 3 else None
             swd = inv_cfg.get("swd_targets", ["phase"])
             if "phase" in swd or "both" in swd:
-                targets.append(Targets.RayleighDispersionPhase(periods, phase))
+                targets.append(Targets.RayleighDispersionPhase(periods, phase,
+                                                               yerr=yerr))
             if "group" in swd or "both" in swd:
-                targets.append(Targets.RayleighDispersionGroup(periods, group))
+                targets.append(Targets.RayleighDispersionGroup(periods, group,
+                                                               yerr=yerr))
 
     if not targets:
         return None
@@ -147,15 +158,17 @@ def invert_station(cfg, station, rf_cfg, out_root) -> Path | None:
         "vpvs": vpvs_prior,
     }
     # Weighting: fix BayHunter's data-noise sigma to the paper's guide values so the
-    # RF-vs-SWD balance matches (likelihood ~ 1/sigma^2). BayHunter samples noise in
-    # [min,max]; min==max fixes it. Verified keys: rfnoise_sigma / swdnoise_sigma
+    # RF-vs-SWD balance matches (likelihood ~ 1/sigma^2). BayHunter's fix mechanism
+    # is a SCALAR prior (SingleChain.draw_initnoiseparams checks `type(...) in
+    # [int, float]`); a (x, x) tuple keeps the sigma in the proposal pool and every
+    # proposal is auto-rejected. Verified keys: rfnoise_sigma / swdnoise_sigma
     # (BayHunter defaults.ini [modelpriors]). Drop misfit_sigma to let it estimate
     # noise hierarchically instead.
     sigma = inv_cfg.get("misfit_sigma") or {}
     if "rf" in sigma:
-        priors["rfnoise_sigma"] = (float(sigma["rf"]), float(sigma["rf"]))
+        priors["rfnoise_sigma"] = float(sigma["rf"])
     if "swd" in sigma:
-        priors["swdnoise_sigma"] = (float(sigma["swd"]), float(sigma["swd"]))
+        priors["swdnoise_sigma"] = float(sigma["swd"])
     mcmc = inv_cfg.get("mcmc", {})
     station_dir = io_utils.ensure_dir(out_root / station)
     initparams = {
@@ -166,17 +179,60 @@ def invert_station(cfg, station, rf_cfg, out_root) -> Path | None:
         "acceptance": (40, 45),
         "thickmin": 0.1,
         "rcond": 1e-5,
-        "savepath": str(station_dir),   # BayHunter writes storage/plots here
+        "savepath": str(station_dir),   # BayHunter writes chain .npy storage here
         "station": station,
     }
     try:
         optimizer = MCMC_Optimizer(joint, initparams=initparams, priors=priors)
         optimizer.mp_inversion(nthreads=initparams["nchains"], baywatch=False, dtsend=1)
     except Exception as e:
-        LOG.warning(f"{station}: BayHunter inversion failed ({e}).")
+        LOG.warning(f"{station}: BayHunter inversion failed ({e!r}).", exc_info=True)
         return None
+    _export_posterior(cfg, station_dir, station)
     LOG.info(f"{station}: inversion complete -> {station_dir}")
     return station_dir
+
+
+def _export_posterior(cfg, station_dir: Path, station: str) -> None:
+    """Aggregate BayHunter's saved chains into ``vs_profile.txt`` (+ its plots).
+
+    BayHunter only writes per-chain ``data/c*_p2models.npy`` etc.; nothing else
+    in the pipeline would otherwise turn those into the median Vs(z) profile
+    that Stage 9 (figure F11) reads.
+    """
+    data_dir = station_dir / "data"
+    model_files = sorted(data_dir.glob("c*_p2models.npy"))
+    if not model_files:
+        LOG.warning(f"{station}: no posterior chain files under {data_dir} — "
+                    f"vs_profile.txt not written.")
+        return
+    try:
+        from BayHunter import ModelMatrix
+
+        models = np.vstack([np.load(f) for f in model_files])
+        depth_max = float(cfg.get("inversion", {}).get("depth_max", 60))
+        dep = np.arange(0.0, depth_max + 0.25, 0.25)
+        vss, _ = ModelMatrix.get_interpmodels(models, dep)
+        med = np.median(vss, axis=0)
+        p16, p84 = np.percentile(vss, [16, 84], axis=0)
+        out = station_dir / "vs_profile.txt"
+        np.savetxt(out, np.column_stack([dep, med, p16, p84]), fmt="%10.4f",
+                   header="depth_km vs_median_km_s vs_p16 vs_p84")
+        LOG.info(f"{station}: posterior median Vs(z) -> {out} "
+                 f"({len(models)} models)")
+    except Exception as e:
+        LOG.warning(f"{station}: could not export vs_profile.txt ({e!r}).")
+        return
+    # BayHunter's own summary figures (best models/fits); optional.
+    try:
+        from BayHunter import PlotFromStorage
+
+        cfile = next(data_dir.glob("*_config.pkl"))
+        plotter = PlotFromStorage(str(cfile))
+        plotter.save_final_distribution(maxmodels=100000, dev=0.05)
+        plotter.save_plots()
+    except Exception as e:
+        LOG.debug(f"{station}: BayHunter plots skipped ({e!r}).")
 
 
 def run(cfg: dict) -> Path:

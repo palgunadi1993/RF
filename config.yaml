@@ -79,31 +79,38 @@ catalogs:
 # teleseismic are all supported from one config.
 # -----------------------------------------------------------------------------
 rf:
+  # NOTE: the paper (Criado-Sutti et al. 2026) used water-level deconvolution
+  # (a=0.5, c=0.1, band 0.01-2 Hz). The iterative time-domain default and the
+  # wider bands below are deliberate choices for the Dieng 5 Hz nodes, not the
+  # paper's values. Set deconvolve: freqattr + deconv_params.waterlevel to match.
   defaults:
     phase: P
     deconvolve: time            # time (iterative) | freqattr (water-level)
     deconv_params: {f1: 0.03, f2: 20.0, max_iters: 400, min_deltaE: 0.001}
-    window: [-10, 35]           # s relative to P
-    noise_window: [-30, -10]    # s, for SNR
+    window: [-10, 35]           # s relative to P (the saved RF window)
+    signal_window: [-2, 8]      # s rel. P, SNR numerator
+    noise_window: [-30, -10]    # s rel. P, SNR denominator (checked pre-trim)
     snr_min: 1.5
-    bin_baz_deg: 10             # back-azimuth binning width
-    bin_overlap_deg: 5
-    moveout_ref_slowness: 0.06  # s/km reference for moveout
-    stack: linear               # linear | phase_weighted
+    moveout_ref_slowness: 0.06  # s/km reference for the stacked-RF moveout
+    stack: linear               # linear | phase_weighted (Schimmel & Paulssen)
+    pws_power: 2                # nu, only used when stack: phase_weighted
   classes:
     teleseismic:
       rotate: ZNE->RT
       gauss: 1.5                 # Gaussian width a (~<=1 Hz)
-      slowness_range: [0.04, 0.08]
+      slowness_range: [0.04, 0.08]   # s/km (compared after s/deg -> s/km conversion)
     regional:
       rotate: ZNE->RT
       gauss: 2.5
-      slowness_range: [0.06, 0.10]
+      slowness_range: [0.06, 0.10]   # s/km
     local_deep:
       rotate: ZNE->LQT           # steep incidence -> LQT
       gauss: 3.0                 # high-frequency content (suits 5 Hz nodes)
-      slowness_range: [0.00, 0.05]
-      local_model: data/local_1d.nd   # for per-event ray-parameter (TauPy/cake)
+      phase: p                   # deep events at local distance: upgoing leg is
+                                 # TauP 'p' ('P' returns ZERO arrivals here)
+      slowness_range: [0.00, 0.15]   # s/km; steep local rays reach ~0.13 s/km
+      local_model: data/local_1d.nd  # optional .nd for per-event ray parameters;
+                                     # falls back to iasp91 if the file is absent
 
 # -----------------------------------------------------------------------------
 # STAGE 3 — H–k stacking (rf / seispy)
@@ -116,11 +123,13 @@ hk:
   k_step:   0.05
   weights:  [0.6, 0.3, 0.1]     # Ps, PpPs, PsPs amplitude weights
   run_on: [local_deep, teleseismic]   # order shallow->deep for the depth correction
-  depth_correct_k: true         # bottom-up recursive k correction (paper App. A)
-  # correction_layers: one {vp, thick_km} per class in run_on (shallow->deep). The
-  # per-class cumulative kappa become the measured profile kmeas_i; App. A recovers
-  # intrinsic per-layer Vp/Vs -> hk_corrected.csv. Needs >=2 classes; leave unset to
-  # report raw (uncorrected) kappa.
+  depth_correct_k: true         # recursive k correction (paper App. A, Eq. A6)
+  # correction_layers: one {vp, thick_km} per class in run_on (shallow->deep; the
+  # code reverses to Eq. A1's deepest-first indexing internally). The per-class
+  # cumulative kappa become the measured profile kmeas_i; App. A recovers intrinsic
+  # per-layer Vp/Vs -> hk_corrected.csv. Needs >=2 classes; leave unset to report
+  # raw (uncorrected) kappa. NOTE: vp/thickness here are Dieng estimates supplied
+  # by the user — the paper used its own regional Vp(z) model; adapt to yours.
   correction_layers:
     - {vp: 5.0, thick_km: 8.0}    # shallow layer (local_deep)
     - {vp: 6.4, thick_km: 22.0}   # deeper layer (teleseismic)
@@ -145,8 +154,10 @@ ant:
   amb_noise_tools_dir: /home/kadek/Documents/software/amb_noise_tools  # clone of ekaestle/amb_noise_tools
   cc_len: 3600                  # s, correlation window (noisecorr window_length)
   cc_step: 1800                 # s, step -> overlap = 1 - cc_step/cc_len (=0.5 here)
-  freq_norm: rma                # any non-empty value -> whiten=True in noisecorr
-  time_norm: one_bit            # one_bit -> onebit=True in noisecorr
+  freq_norm: whiten             # any non-empty value -> whiten=True in noisecorr
+                                # (plain |D|+waterlevel division, not NoisePy's RMA)
+  time_norm: none               # 'one_bit' -> onebit=True in noisecorr; upstream
+                                # flags its one-bit as "not well implemented" -> off
   water_level: 60               # whitening water level (dB) for noisecorr
   components: ZZ                # Rayleigh (Z-Z)
   target_sampling_rate: 20      # Hz, downsample before correlation
@@ -250,7 +261,6 @@ plot:
     F12_structural_model: true
   # ---- figure-specific params ----
   cross_sections: [NS, EW]
-  dispersion_map_periods: [1, 2, 3, 5]    # F9
-  representative_stations: [01A, 05A]      # F4 / F10 example panels
-  overlay: [hk, ccp, inversion]            # interface overlays on F11
+  vs_slice_depths_km: [2, 5, 10, 20]       # F9 Vs depth slices (tomo.path == A)
+  representative_stations: [ST01, ST05]    # F4 / F10 example panels (DG codes)
   ccf_bandpass: [0.2, 0.4]                 # Hz, F8 gather

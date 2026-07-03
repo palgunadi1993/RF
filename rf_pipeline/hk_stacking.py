@@ -25,6 +25,8 @@ from .logging_setup import get_logger
 
 LOG = get_logger("rf.hk_stacking")
 
+_KM_PER_DEG = 111.19492664455873   # rf stores slowness in s/deg; formulas need s/km
+
 
 def _read_rfs(path: Path):
     """Load individual RFs from a Stage-2 H5 file (needs rf/obspyh5)."""
@@ -41,16 +43,26 @@ def bottom_up_kappa_correction(kmeas, vp, thick):
     """Recover intrinsic per-layer Vp/Vs from cumulative H-k measurements.
 
     Criado-Sutti et al. (2026, Solid Earth 17, 711-733), Appendix A. The measured
-    (effective) ratio at depth index i is the weight-averaged intrinsic ratio over
-    all layers below (Eq. A1); inverting the upper-triangular weight system gives the
-    bottom-up recursion (Eq. A6):
+    (apparent) ratio at a discontinuity is the vp*H-weighted mean of the intrinsic
+    ratios of all layers between the surface and that discontinuity (Eq. A1);
+    inverting the triangular weight system gives the recursion (Eq. A6):
 
         k_i = (kmeas_i * N_i - kmeas_{i+1} * N_{i+1}) / w_i,
         w_j = vp_j * H_j,   N_i = sum_{j>=i} w_j
 
-    Arrays are ordered top (index 0) to bottom. Returns the intrinsic Vp/Vs per layer.
-    The recursion is anchored at the deepest layer (k_n = kmeas_n) and is stable there;
-    shallow layers with small vp*H are sensitive to deeper-layer errors (Eq. A12).
+    ORDERING (this is what Eq. A1 implies): index 0 must be the DEEPEST
+    measurement/layer and the last index the shallowest, i.e.
+
+        kmeas[0]  = apparent ratio at the deepest discontinuity (whole stack),
+        kmeas[-1] = apparent ratio at the shallowest discontinuity (top layer),
+
+    with ``vp``/``thick`` the matching per-layer values, deepest layer first.
+    Then kmeas_i * N_i = sum_{j>=i} k_j * w_j holds because layers j>=i are
+    exactly the layers above discontinuity i. The recursion is anchored at the
+    shallowest layer (k_n = kmeas_n); layers with small vp*H are sensitive to
+    errors in the other measurements (Eq. A12).
+
+    Returns the intrinsic Vp/Vs per layer, same (deepest-first) order.
     """
     kmeas = np.asarray(kmeas, float)
     vp = np.asarray(vp, float)
@@ -94,10 +106,14 @@ def hk_stack(rfs, vp, h_grid, k_grid, weights, t_ps_min=1.0):
     n_used = 0
     HH, KK = np.meshgrid(h_grid, k_grid, indexing="ij")
     for tr in rfs:
-        p = float(getattr(tr.stats, "slowness", np.nan))
+        # per-event ray parameter: rf/rfstats store it in s/deg. If the trace
+        # was moveout-corrected, the original survives in slowness_before_moveout.
+        p = float(getattr(tr.stats, "slowness_before_moveout",
+                          getattr(tr.stats, "slowness", np.nan)))
         onset = getattr(tr.stats, "onset", None)
         if not np.isfinite(p) or onset is None:
             continue
+        p /= _KM_PER_DEG  # s/deg -> s/km, the unit _phase_times needs
         t0 = tr.stats.onset - tr.stats.starttime  # seconds from trace start to onset
         dt = tr.stats.delta
         data = tr.data
@@ -109,7 +125,11 @@ def hk_stack(rfs, vp, h_grid, k_grid, weights, t_ps_min=1.0):
             return data[idx]
 
         t_ps, t_ppps, t_ppss = _phase_times(HH, KK, vp, p)
-        mask = t_ps >= t_ps_min
+        # exclude the degenerate H~0 corner AND any cell whose predicted
+        # arrivals fall beyond the trimmed RF window (clipping would otherwise
+        # re-sample the last point as fake coherent amplitude).
+        t_max = (n - 1) * dt - t0
+        mask = (t_ps >= t_ps_min) & (t_ppps <= t_max) & (t_ppss <= t_max)
         contrib = (w1 * amp(t_ps) + w2 * amp(t_ppps) - w3 * amp(t_ppss)) * mask
         stack += contrib
         valid += mask
@@ -117,6 +137,10 @@ def hk_stack(rfs, vp, h_grid, k_grid, weights, t_ps_min=1.0):
     if n_used == 0:
         return stack, (np.nan, np.nan), 0
     stack = np.divide(stack, valid, out=np.full_like(stack, -np.inf), where=valid > 0)
+    if not np.isfinite(stack).any():
+        # every cell invalid (e.g. all arrivals outside the window): no answer,
+        # not the grid corner.
+        return stack, (np.nan, np.nan), n_used
     i, j = np.unravel_index(np.argmax(stack), stack.shape)
     return stack, (float(h_grid[i]), float(k_grid[j])), n_used
 
@@ -164,6 +188,10 @@ def run(cfg: dict) -> Path:
             if n_used == 0:
                 LOG.info(f"[{name}] {station}: no RFs with slowness — skipped.")
                 continue
+            if not np.isfinite(bestH):
+                LOG.warning(f"[{name}] {station}: H-kappa grid entirely invalid "
+                            f"(n={n_used} RFs) — skipped.")
+                continue
             h_lo, h_hi, k_lo, k_hi = _bounds(stack, h_grid, k_grid)
             rows.append({"station": station, "H_km": bestH, "kappa": bestK,
                          "vp": vp, "n_rf": n_used,
@@ -188,14 +216,21 @@ def run(cfg: dict) -> Path:
 
 
 def _apply_depth_correction(hk, run_on, by_class, out_dir):
-    """Apply the Appendix-A bottom-up kappa correction across a layered profile.
+    """Apply the Appendix-A kappa correction across a layered profile.
 
-    H-kappa yields one *cumulative* Vp/Vs per (station, class). When ``run_on`` lists
-    classes of increasing depth sensitivity (e.g. local_deep = shallower, teleseismic
-    = deeper) and ``hk.correction_layers`` supplies the (vp, thickness) of each
-    corresponding layer, those per-class kappa form the cumulative measured profile
-    kmeas_i and the intrinsic per-layer Vp/Vs is recovered with
-    :func:`bottom_up_kappa_correction`. Writes hk_corrected.csv.
+    H-kappa yields one *cumulative* (surface-to-discontinuity) Vp/Vs per
+    (station, class). ``run_on`` lists classes ordered SHALLOW -> DEEP (e.g.
+    local_deep sees the shallow discontinuity, teleseismic the Moho) and
+    ``hk.correction_layers`` supplies the matching (vp, thickness) per layer in
+    the same shallow->deep order. Eq. A1/A6 index layers with the deepest
+    measurement first, so the arrays are REVERSED before calling
+    :func:`bottom_up_kappa_correction` and the result is reversed back.
+    Writes hk_corrected.csv.
+
+    NOTE this class-as-depth-level scheme is an *adaptation* for this pipeline:
+    the paper itself corrects the multiple discontinuities picked within each
+    station's own H-k stacks (its Table 3), using a published Vp(z) and a Moho
+    anchor. Eq. A9 error propagation is not implemented here.
 
     A single class (one cumulative measurement) has nothing to correct — the
     correction needs >= 2 depth levels — so in that case the raw kappa stands and a
@@ -220,7 +255,9 @@ def _apply_depth_correction(hk, run_on, by_class, out_dir):
     for sta in sorted(common):
         kmeas = np.array([float(by_class[c].set_index("station").loc[sta, "kappa"])
                           for c in run_on])
-        kint = bottom_up_kappa_correction(kmeas, vp, thick)
+        # run_on / correction_layers are shallow->deep; Eq. A1/A6 want the
+        # deepest (whole-stack) measurement at index 0 -> reverse in, reverse out.
+        kint = bottom_up_kappa_correction(kmeas[::-1], vp[::-1], thick[::-1])[::-1]
         row = {"station": sta}
         for c, km, ki, th in zip(run_on, kmeas, kint, thick):
             row[f"kappa_meas_{c}"] = km

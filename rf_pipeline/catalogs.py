@@ -28,7 +28,7 @@ def _centroid(stations) -> tuple[float, float]:
 
 def _deployment_window(cfg: dict) -> tuple[date, date]:
     """Deployment window from ``data.date_range`` or, failing that, the data itself."""
-    dr = cfg.get("data", {}).get("date_range") or cfg.get("input", {}).get("date_range")
+    dr = cfg.get("data", {}).get("date_range")
     if dr and dr[0] and dr[1]:
         return io_utils.parse_iso_date(dr[0]), io_utils.parse_iso_date(dr[1])
     p = io_utils.paths(cfg)

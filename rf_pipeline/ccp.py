@@ -24,6 +24,8 @@ from .logging_setup import get_logger
 
 LOG = get_logger("rf.ccp")
 
+_KM_PER_DEG = 111.19492664455873   # rf stores slowness in s/deg; formulas need s/km
+
 
 def _load_velocity_model(path: Path, dz: float, zmax: float):
     """Read a ``depth_top Vp Vs`` table and expand to Vp(z), Vs(z) on a dz grid."""
@@ -40,8 +42,11 @@ def _load_velocity_model(path: Path, dz: float, zmax: float):
                 rows.append([float(parts[0]), float(parts[1]), float(parts[1]) / 1.73])
     rows = np.array(sorted(rows))
     z = np.arange(0, zmax + dz / 2, dz)
-    vp = np.interp(z, rows[:, 0], rows[:, 1])
-    vs = np.interp(z, rows[:, 0], rows[:, 2])
+    # depth_top rows define piecewise-CONSTANT layers; np.interp would smear a
+    # step model into a gradient and bias the migration times.
+    idx = np.clip(np.searchsorted(rows[:, 0], z, side="right") - 1, 0, len(rows) - 1)
+    vp = rows[idx, 1]
+    vs = rows[idx, 2]
     return z, vp, vs
 
 
@@ -59,19 +64,28 @@ def migrate_trace(tr, z, vp, vs, dz):
     Returns (amp_z, offset_km) where offset is the cumulative S-leg horizontal
     piercing distance from the station at each depth.
     """
-    p = float(getattr(tr.stats, "slowness", np.nan))
+    # per-event ray parameter: rf/rfstats store it in s/deg -> convert to s/km.
+    p = float(getattr(tr.stats, "slowness_before_moveout",
+                      getattr(tr.stats, "slowness", np.nan)))
     onset = getattr(tr.stats, "onset", None)
     if not np.isfinite(p) or onset is None:
         return None, None
+    p /= _KM_PER_DEG
     eta_s = np.sqrt(np.clip(1.0 / vs**2 - p**2, 0, None))
     eta_p = np.sqrt(np.clip(1.0 / vp**2 - p**2, 0, None))
-    t_of_z = np.cumsum((eta_s - eta_p) * dz)          # delay time at each depth
-    offset = np.cumsum(p * vs / np.sqrt(np.clip(1 - (p * vs) ** 2, 1e-6, None)) * dz)
+    # t(z_k) integrates the layers ABOVE z_k, so t(0) = 0 (a bare cumsum starts
+    # one cell late and biases every depth by ~dz).
+    dtdz = (eta_s - eta_p) * dz
+    t_of_z = np.concatenate(([0.0], np.cumsum(dtdz[:-1])))
+    dxdz = p * vs / np.sqrt(np.clip(1 - (p * vs) ** 2, 1e-6, None)) * dz
+    offset = np.concatenate(([0.0], np.cumsum(dxdz[:-1])))
 
     t0 = tr.stats.onset - tr.stats.starttime
     dt = tr.stats.delta
-    idx = np.clip(np.round((t0 + t_of_z) / dt).astype(int), 0, tr.data.size - 1)
-    return tr.data[idx], offset
+    idx = np.round((t0 + t_of_z) / dt).astype(int)
+    ok = (idx >= 0) & (idx < tr.data.size)
+    amp = np.where(ok, tr.data[np.clip(idx, 0, tr.data.size - 1)], np.nan)
+    return amp, offset
 
 
 def _geo_to_local_km(lat, lon, lat0, lon0):
@@ -102,6 +116,7 @@ def _read_rfs(path: Path):
 def run(cfg: dict) -> Path:
     ccp = cfg.get("ccp", {})
     dz = float(ccp.get("depth_step", 0.5))
+    zmin = float(ccp.get("depth_range", [0, 60])[0])
     zmax = float(ccp.get("depth_range", [0, 60])[1])
     run_on = ccp.get("run_on", ["teleseismic", "local_deep"])
     profiles = ccp.get("profiles", [])
@@ -153,7 +168,11 @@ def run(cfg: dict) -> Path:
                     px = sx + offset * np.sin(baz)
                     py = sy + offset * np.cos(baz)
                     along, perp, _ = _project_onto_profile(px, py, prof)
-                    keep = np.abs(perp) <= width / 2.0
+                    # gate on BOTH axes: off-end samples must be dropped, not
+                    # clipped into the terminal bins; NaN amp = beyond RF window.
+                    keep = ((np.abs(perp) <= width / 2.0)
+                            & (along >= 0) & (along <= L)
+                            & np.isfinite(amp_z))
                     bi = np.clip(np.searchsorted(along_bins, along) - 1, 0,
                                  along_bins.size - 1)
                     for k in np.where(keep)[0]:
@@ -164,10 +183,15 @@ def run(cfg: dict) -> Path:
                 LOG.info(f"[{prof['name']}/{name}] no migrated amplitudes — skipped.")
                 continue
             stacked = np.divide(grid, count, out=np.zeros_like(grid), where=count > 0)
+            # migration always integrates from the surface; honour the
+            # configured minimum depth only in the saved/plotted section.
+            zsel = z >= zmin
             tag = f"{prof['name']}_{name}"
             npz = out_dir / f"{tag}.npz"
-            np.savez(npz, along=along_bins, depth=z, amp=stacked, count=count)
-            _plot_section(along_bins, z, stacked, tag, out_dir / f"{tag}.png")
+            np.savez(npz, along=along_bins, depth=z[zsel], amp=stacked[:, zsel],
+                     count=count[:, zsel])
+            _plot_section(along_bins, z[zsel], stacked[:, zsel], tag,
+                          out_dir / f"{tag}.png")
             LOG.info(f"[{tag}] CCP section -> {npz}")
 
     LOG.info("Stage 4 (CCP) complete.")
@@ -181,7 +205,9 @@ def _plot_section(along, depth, amp, name, out_png):
         import matplotlib.pyplot as plt
 
         fig, ax = plt.subplots(figsize=(8, 4))
-        vmax = np.nanpercentile(np.abs(amp), 98) or 1.0
+        vmax = np.nanpercentile(np.abs(amp), 98)
+        if not np.isfinite(vmax) or vmax <= 0:  # `or` would keep NaN (truthy)
+            vmax = 1.0
         im = ax.pcolormesh(along, depth, amp.T, cmap="RdBu_r", vmin=-vmax, vmax=vmax,
                            shading="auto")
         ax.invert_yaxis()

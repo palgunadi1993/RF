@@ -8,13 +8,19 @@ all driven from the one YAML (PLAN.md Stage 2).
 For each (station, class) we:
   1. cut a wide 3C window around the theoretical P arrival for every catalog event,
   2. remove instrument response and attach per-event ray geometry (``rf.rfstats``),
-  3. rotate + iterative time-domain deconvolution -> radial/transverse RF (``rf()``),
-  4. move-out correct to a reference slowness,
-  5. QC by SNR, then linear-stack the radial RF used downstream by the inversion.
+  3. rotate + deconvolution -> radial/transverse RF (``rf()``),
+  4. QC by SNR, write the individual RFs *without* moveout correction (H-kappa and
+     CCP need each RF's own per-event slowness and un-distorted multiples),
+  5. moveout-correct a copy to a reference slowness and stack it -> inversion input.
+
+Note on deconvolution: Criado-Sutti et al. (2026) used *water-level* deconvolution
+(Gaussian a=0.5, water level c=0.1, band 0.01-2 Hz). This pipeline defaults to
+iterative time-domain (Ligorria & Ammon 1999) with wider bands tuned for the Dieng
+nodes — a deliberate difference, switchable via ``deconvolve: waterlevel``.
 
 Outputs per station/class:
-  rf_out/<station>_<class>.h5           individual QC-passed RFs (obspyh5)
-  rf_out/<station>_<class>_stack.sac     linear-stacked radial RF (inversion input)
+  rf_out/<station>_<class>.h5           individual QC-passed RFs (no moveout)
+  rf_out/<station>_<class>_stack.sac     moveout-corrected stacked radial RF
 """
 from __future__ import annotations
 
@@ -52,9 +58,9 @@ _ROTATE_MAP = {
 # Radial-equivalent component letter after each rotation.
 _RADIAL_COMP = {"NE->RT": "R", "ZNE->LQT": "Q"}
 
-# Config deconvolution value -> rf method name. The paper (and PLAN.md Stage 2)
-# use *iterative* time-domain deconvolution; rf's 'time' method is the damped
-# variant, so config 'time' maps to rf 'iterative'.
+# Config deconvolution value -> rf method name. rf's 'time' method is the damped
+# variant; config 'time'/'iterative' map to rf 'iterative' (Ligorria & Ammon).
+# (The paper itself used water-level deconvolution — see module docstring.)
 _DECONV_MAP = {
     "time": "iterative", "iterative": "iterative",
     "freqattr": "waterlevel", "waterlevel": "waterlevel", "freq": "waterlevel",
@@ -147,6 +153,29 @@ def _snr(tr, onset, signal=(-2.0, 8.0), noise=(-25.0, -5.0)) -> float:
     return float(np.sqrt(np.mean(sig ** 2)) / nrms)
 
 
+def _stack_rfs(kept, method: str = "linear", nu: float = 2.0):
+    """Stack an RFStream of equal-length radial RFs: linear or phase-weighted.
+
+    Phase-weighted stack (Schimmel & Paulssen 1997): the linear stack is scaled
+    sample-by-sample by ``|mean(exp(i*phi_k))|**nu`` where phi_k is each trace's
+    instantaneous phase (Hilbert transform). Coherent arrivals keep their
+    amplitude; incoherent noise is down-weighted.
+    """
+    stack = kept.copy().stack()
+    if str(method).lower() in ("phase_weighted", "pws"):
+        from scipy.signal import hilbert
+
+        nmin = min(tr.data.size for tr in kept)
+        arr = np.array([tr.data[:nmin] for tr in kept], dtype=float)
+        analytic = hilbert(arr, axis=1)
+        mag = np.abs(analytic)
+        mag[mag == 0] = 1.0
+        coherence = np.abs(np.mean(analytic / mag, axis=0)) ** float(nu)
+        stack[0].data = arr.mean(axis=0)[: stack[0].data.size] \
+            * coherence[: stack[0].data.size]
+    return stack
+
+
 def compute_class(cfg, name, stations, inv, index, out_dir) -> dict[str, Path]:
     """Compute + stack RFs for one source class across all stations."""
     rf = _require_rf()
@@ -185,11 +214,15 @@ def compute_class(cfg, name, stations, inv, index, out_dir) -> dict[str, Path]:
             try:
                 stats = rfstats(station=coords, event=ev, phase=params.get("phase", "P"),
                                 dist_range=dist_range, tt_model=tt_model)
-            except Exception:
+            except Exception as e:
+                LOG.debug(f"[{name}] {sta.code}: rfstats failed for event "
+                          f"{getattr(origin, 'time', '?')}: {e}")
                 stats = None
             if stats is None:
                 continue
-            if slow_range and not (slow_range[0] <= stats.slowness <= slow_range[1]):
+            # rfstats stores slowness in s/deg; config slowness_range is s/km.
+            p_km = stats.slowness / _KM_PER_DEG
+            if slow_range and not (slow_range[0] <= p_km <= slow_range[1]):
                 continue
             # cut a wide 3C window around the theoretical onset; rf trims later.
             st = io_utils.read_event_window_3c(stats.onset, sta, index,
@@ -211,8 +244,8 @@ def compute_class(cfg, name, stations, inv, index, out_dir) -> dict[str, Path]:
             LOG.info(f"[{name}] {sta.code}: no usable events.")
             continue
 
-        # rotate + deconvolve -> RFs. The paper's f1/f2 are a bandpass applied
-        # before deconvolution (rf's `filter` kwarg); the iterative time-domain
+        # rotate + deconvolve -> RFs. f1/f2 are a bandpass applied before
+        # deconvolution (rf's `filter` kwarg); the iterative time-domain
         # deconvolution takes gauss/itmax/minderr (verified against rf source:
         # rf.deconvolve.deconv_iterative). See rf.RFStream.rf docstring.
         bandpass = {"type": "bandpass",
@@ -221,35 +254,51 @@ def compute_class(cfg, name, stations, inv, index, out_dir) -> dict[str, Path]:
                     "corners": 2, "zerophase": True}
         deconv_kwargs = _deconv_kwargs(deconv, gauss, dp)
         phase = params.get("phase", "P")
-        stream.rf(method=phase, rotate=rotate, filter=bandpass,
+        # rf's method must be 'P' or 'S'; the TauP phase may be lowercase
+        # (e.g. 'p' for the upgoing leg of deep local events).
+        stream.rf(method=phase[-1].upper(), rotate=rotate, filter=bandpass,
                   deconvolve=deconv, **deconv_kwargs)
-        # rf.moveout ref is slowness in s/deg; config value is s/km -> convert.
-        ref_sdeg = float(params.get("moveout_ref_slowness", 0.06)) * _KM_PER_DEG
-        stream.moveout(ref=ref_sdeg)
-        stream.trim2(win[0], win[1], reftime="onset")
 
-        # QC on the radial RF by SNR
+        # QC on the radial RF by SNR *before* trimming, so the configured
+        # pre-onset noise window (which may lie outside the final RF window)
+        # is still available on the deconvolved trace.
+        sig_win = tuple(params.get("signal_window", [-2.0, 8.0]))
+        noi_win = tuple(params.get("noise_window", [-25.0, -5.0]))
         rad = stream.select(component=radial)
         kept = RFStream()
         for tr in rad:
-            if _snr(tr, tr.stats.onset) >= snr_min:
+            if _snr(tr, tr.stats.onset, signal=sig_win, noise=noi_win) >= snr_min:
                 kept.append(tr)
         if len(kept) == 0:
             LOG.info(f"[{name}] {sta.code}: {len(rad)} RFs, none passed SNR>= {snr_min}.")
             continue
+        kept.trim2(win[0], win[1], reftime="onset")
 
-        # persist individual RFs + linear stack of the radial component
+        # persist individual RFs WITHOUT moveout correction: H-kappa and CCP
+        # need each trace's own slowness and unshifted multiples (rf.moveout
+        # overwrites stats.slowness with the reference and applies the Ps
+        # operator, which mis-times PpPs/PpSs).
         h5 = out_dir / f"{sta.code}_{name}.h5"
         try:
             kept.write(str(h5), "H5")
         except Exception as e:
             LOG.warning(f"[{name}] {sta.code}: could not write H5 ({e}).")
-        stack = kept.copy().stack()
+
+        # moveout-correct a copy to the reference slowness, then stack it for
+        # the joint inversion (rf.moveout ref is s/deg; config is s/km).
+        ref_sdeg = float(params.get("moveout_ref_slowness", 0.06)) * _KM_PER_DEG
+        mo = kept.copy()
+        # NOTE: rf.moveout's `model` kwarg wants a SimpleModel depth/vp/vs .dat
+        # table, NOT the TauP .npz used by rfstats, so the default (iasp91) is
+        # used here; the near-surface timing effect on the stretch is small.
+        mo.moveout(ref=ref_sdeg)
+        stack = _stack_rfs(mo, method=str(params.get("stack", "linear")),
+                           nu=float(params.get("pws_power", 2.0)))
         sac = out_dir / f"{sta.code}_{name}_stack.sac"
         stack.write(str(sac), "SAC")
         produced[sta.code] = sac
         LOG.info(f"[{name}] {sta.code}: {n_events} events -> {len(kept)} RFs, "
-                 f"stacked -> {sac.name}")
+                 f"stacked ({params.get('stack', 'linear')}) -> {sac.name}")
     return produced
 
 

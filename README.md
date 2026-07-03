@@ -14,7 +14,7 @@ python run_rf.py         --config config.yaml   # Stage 2  receiver functions
 python run_hk.py         --config config.yaml   # Stage 3  H-kappa stacking
 python run_ccp.py        --config config.yaml   # Stage 4  CCP imaging
 python run_ant.py        --config config.yaml   # Stage 5  noise cross-correlation
-python run_dispersion.py --config config.yaml   # Stage 6  dispersion (FTAN)
+python run_dispersion.py --config config.yaml   # Stage 6  dispersion (zero-crossing picking)
 python run_tomo.py       --config config.yaml   # Stage 7  per-station curves
 python run_dsurftomo.py  --config config.yaml   # Stage 7-alt  DSurfTomo 3-D (opt-in)
 python run_inversion.py  --config config.yaml   # Stage 8  joint RF+SWD inversion
@@ -72,10 +72,14 @@ publicly distributable:
 | 7-alt / path A | **DSurfTomo** (HongjianFang/DSurfTomo) | `src/main.f90` reader, `GenerateDSurfTomoInputFile.py`, `GenerateIniMOD.py` | wired (needs compiled binary) |
 
 Cited built-ins were chosen over blind-wiring uninstalled tools because an inspectable
-implementation is more verifiable. Every non-trivial core is unit-tested on synthetics:
-H-kappa recovers a known `H=30 km, Vp/Vs=1.75`; the Appendix-A correction round-trips
-intrinsic Vp/Vs exactly; FTAN recovers a known group velocity; PWS improves S/N over a
-linear stack; DSurfTomo input files match the reference format byte-for-structure.
+implementation is more verifiable. The non-trivial cores are unit-tested on synthetics
+in [`tests/test_cores.py`](tests/test_cores.py) (`python tests/test_cores.py`):
+H-kappa recovers a known `H=30 km, Vp/Vs=1.75` from spike RFs carrying s/deg slowness;
+the Appendix-A correction round-trips intrinsic Vp/Vs to machine precision (including
+the two-class shallow/deep scheme); CCP migrates a 30-km Ps spike back to 30 km; the
+phase-weighted stack improves S/N over a linear stack; a degenerate H-k grid returns
+NaN, not the grid corner. (Dispersion picking is `amb_noise_tools`' zero-crossing
+method, not FTAN, and is validated upstream, not here.)
 
 ## Known limitations / not-yet-wired (honest list)
 
@@ -87,13 +91,32 @@ linear stack; DSurfTomo input files match the reference format byte-for-structur
   drive `nqdu/RfSurfHmc` externally from the same exported RF stacks + `tomo/<sta>_disp.txt`.
   (BayHunter already covers Stage 8; RfSurfHmc is only for exact paper reproduction.)
 - **Real data has not been run** end-to-end yet (external drive not mounted at build
-  time). Code imports cleanly and every numerical core passes synthetic tests; the
-  `rf`/BayHunter stages need those packages installed and the drive attached to run.
+  time). Code imports cleanly and the numerical cores pass the synthetic tests in
+  `tests/`; the `rf`/BayHunter stages need those packages installed and the drive
+  attached to run.
+- **Group velocity is not measured**: `get_smooth_pv` picks phase velocity only, so the
+  group column in `.disp`/`tomo` files is NaN. Do not set `inversion.swd_targets:
+  [group]` or `dsurftomo.measure: group` — there is no data behind them.
+- **The bundled `zeckra_2/` and `criado-sutti_1/` folders are reference material from
+  the paper's Argentina study** (catalogs, focal mechanisms); no stage reads them.
+  Stage 1 builds/fetches its own Dieng catalogs under `data/catalogs/`.
+- **Processing parameters deliberately differ from the paper** where the Dieng nodes
+  warrant it (iterative vs water-level deconvolution, wider RF bands, 0.5–8 s
+  dispersion periods); the paper's values are documented in comments in `config.yaml`.
 
 Now closed (previously listed here): the Appendix-A depth-dependent kappa correction is
 implemented and unit-tested; Stages 5–6 (ANT CC + dispersion) now run on the validated
 `amb_noise_tools` instead of hand-written code; `inversion.misfit_sigma` is wired into
-BayHunter's noise priors; FMST is replaced by DSurfTomo.
+BayHunter's noise priors (as scalar "fixed" priors, the designed mechanism); FMST is
+replaced by DSurfTomo. A 2026-07 audit against the upstream sources fixed: s/deg vs
+s/km slowness handling in the Stage-2 QC gate, H-k and CCP (previously fatal); H-k/CCP
+now consume un-moveout-corrected RFs (Stage 2 writes raw RFs to the H5 and moveout
+only for the stack); the Appendix-A correction's layer ordering; a numpy>=1.24
+`np.float` shim for BayHunter plus posterior export to `inversion/<sta>/vs_profile.txt`
+(feeds figure F11); the local_deep class now uses TauP phase `p` (phase `P` returns
+zero arrivals at local distances); CCP time-to-depth off-by-one, off-profile-end
+binning and step-model reading; ANT stacking is window-count-weighted and one-bit
+normalization is off by default (upstream flags it as unreliable).
 
 ## Install
 
@@ -269,6 +292,7 @@ Edit the `data:` block in [`config.yaml`](config.yaml) for your machine:
 ```
 rf_pipeline/           importable package (one module per stage)
 run_*.py               thin stage runners (Stage N -> rf_pipeline.<module>.run)
+tests/                 synthetic-recovery tests for the numerical cores
 config.yaml            single source of truth
 data/                  continuous/, stationxml/, catalogs/, qc/
 rf_out/ hk_out/ ccp_out/ ant/ tomo/ inversion/ figures/   stage outputs
