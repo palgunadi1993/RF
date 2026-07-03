@@ -316,6 +316,36 @@ def read_event_window_3c(
 # catalogs
 # ===========================================================================
 
+def import_amb_noise_tools(cfg: dict):
+    """Import Kaestle's ``amb_noise_tools`` ``noise`` module from its clone.
+
+    The repo has no packaging metadata (no setup.py), so it is used by putting its
+    directory on sys.path and importing ``noise``. The directory is read from
+    ``ant.amb_noise_tools_dir`` (falls back to <software>/amb_noise_tools next to the
+    project root's parent). Raises ImportError with guidance if not found.
+    """
+    import sys
+
+    d = cfg.get("ant", {}).get("amb_noise_tools_dir")
+    candidates = []
+    if d:
+        candidates.append(resolve_path(d, cfg["_project_root"]))
+    candidates.append(Path(cfg["_project_root"]).parent / "software" / "amb_noise_tools")
+    candidates.append(Path("~/Documents/software/amb_noise_tools").expanduser())
+    for c in candidates:
+        if c and (Path(c) / "noise.py").exists():
+            if str(c) not in sys.path:
+                sys.path.insert(0, str(c))
+            import noise  # type: ignore
+            return noise
+    raise ImportError(
+        "amb_noise_tools not found. Clone it and set ant.amb_noise_tools_dir:\n"
+        "  git clone https://github.com/ekaestle/amb_noise_tools "
+        "/home/kadek/Documents/software/amb_noise_tools\n"
+        f"  (looked in: {[str(c) for c in candidates]})"
+    )
+
+
 def load_catalog(path: str | Path):
     """Read a QuakeML catalog (returns an ObsPy Catalog)."""
     import obspy

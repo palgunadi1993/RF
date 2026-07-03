@@ -45,18 +45,22 @@ upstream source** (cloned from GitHub), not written from memory:
 | Stage | Tool used | API verified against | Status |
 |---|---|---|---|
 | 2 RF | **`rf`** (trichter/rf) | `rf.RFStream.rf`, `rf.rfstats`, `deconv_iterative`, `moveout`, `trim2` | wired |
+| 5 ANT | **`amb_noise_tools`** (ekaestle) | `noise.noisecorr` | wired |
+| 6 dispersion | **`amb_noise_tools`** (ekaestle) | `noise.velocity_filter`, `noise.get_smooth_pv` | wired |
 | 8 inversion | **BayHunter** (jenndrei/BayHunter) | `Targets.*`, `MCMC_Optimizer`, `rfmini_modrf.set_modelparams` | wired |
 
-The following stages use **transparent, self-contained implementations of standard
-published methods** (installed dependencies: ObsPy/NumPy/SciPy only), with the
-PLAN-named tool documented as a drop-in alternative:
+Stages 5–6 (the noise cross-correlation and dispersion picking — the scientific core
+of the ANT side) are done by the published, validated `amb_noise_tools`; the pipeline
+code is glue only (file discovery, preprocessing, station pairing, spectral stacking,
+period resampling). This is a deliberate choice: the CC/whitening and the zero-crossing
+2π-branch dispersion picking should be a community tool, not hand-written.
+
+The remaining stages use **transparent, cited built-ins** (ObsPy/NumPy/SciPy only):
 
 | Stage | Method (citation) | Named alternative |
 |---|---|---|
 | 3 H-kappa | Zhu & Kanamori (2000) grid stack + Appendix-A bottom-up kappa correction | `seispy hk` / `rf` |
 | 4 CCP | 1-D Ps time-to-depth migration + piercing-point stack | `python-seispy` (`ccpprofile.py`) |
-| 5 ANT | Bensen et al. (2007) whitened CC; phase-weighted stack (Schimmel & Paulssen 1997) | NoisePy |
-| 6 dispersion | FTAN group + phase (Bensen et al. 2007) | `amb_noise_tools` |
 | 7 tomography | two-station average -> per-station curves | (3-D handled by DSurfTomo below) |
 
 Full 3-D tomography is an external Fortran tool wired as *glue only* (writes verified
@@ -87,9 +91,9 @@ linear stack; DSurfTomo input files match the reference format byte-for-structur
   `rf`/BayHunter stages need those packages installed and the drive attached to run.
 
 Now closed (previously listed here): the Appendix-A depth-dependent kappa correction is
-implemented and unit-tested; ANT phase-weighted stacking (`stack_method: pws`) is
-implemented; `inversion.misfit_sigma` is wired into BayHunter's noise priors; FMST is
-replaced by DSurfTomo.
+implemented and unit-tested; Stages 5–6 (ANT CC + dispersion) now run on the validated
+`amb_noise_tools` instead of hand-written code; `inversion.misfit_sigma` is wired into
+BayHunter's noise priors; FMST is replaced by DSurfTomo.
 
 ## Install
 
@@ -126,13 +130,32 @@ sudo apt update && sudo apt install -y build-essential gfortran gcc g++ git cmak
 Runs Stages 1, 3, 4, 5, 6, 7(pathB) and all figures (the transparent built-in stages
 depend on nothing beyond this core).
 
+**Use Python 3.11, not 3.12** — BayHunter (step 3) builds its Fortran kernel with
+`numpy.distutils`, which is removed in Python 3.12 and in numpy ≥ 2.0, and which needs
+`setuptools < 60`. So the env is 3.11 with numpy `<2` and setuptools `<60` pinned.
+
 ```bash
 conda create -n dieng_rf python=3.11 -y
 conda activate dieng_rf
-# ObsPy + PyGMT come cleanest from conda-forge (PyGMT pulls the GMT C library):
-conda install -c conda-forge obspy pygmt numpy scipy pandas pyyaml matplotlib h5py -y
+# ObsPy + PyGMT come cleanest from conda-forge (PyGMT pulls the GMT C library).
+# numpy<2 + setuptools<60 + cython are required so BayHunter's build works (step 3).
+conda install -c conda-forge "numpy<2" "setuptools<60" cython obspy pygmt scipy pandas pyyaml matplotlib h5py -y
 python -c "import obspy, pygmt, numpy, scipy, pandas, yaml, h5py; print('core OK')"
 ```
+
+> If a later `pip install` bumps numpy back to 2.x or setuptools past 60 (breaking the
+> BayHunter build), re-pin before step 3:
+> `conda install -c conda-forge "numpy=1.26" "setuptools<60" cython -y`.
+
+> If PyGMT fails with `libjxl.so.0.11: cannot open shared object file`, the conda-forge
+> `gmt` build was linked against libjxl 0.11 but 0.12 got installed. Pin it back
+> (use your env name after `-n`):
+>
+> ```bash
+> conda install -n RF -c conda-forge "libjxl=0.11" -y
+> ```
+>
+> (PyGMT is only needed for the map figures — Stages 1–8 run without it.)
 
 ### 2. Stage 2 — receiver functions (`rf`, into `dieng_rf`)
 
@@ -143,16 +166,53 @@ python -c "import rf, obspyh5; print('rf', rf.__version__)"
 
 ### 3. Stage 8 — joint inversion (BayHunter, source in the shared dir)
 
-Builds a Fortran kernel (`surfdisp96`) at install, so `gfortran` from step 0 must exist.
+Builds a Fortran kernel (`surfdisp96`) + a Cython/C++ extension (`rfmini`) at install,
+so `gfortran` and `g++` from step 0 must exist. Its `setup.py` uses `numpy.distutils`
+(hence Python 3.11 + numpy<2 from step 1), and it has no `pyproject.toml`, so the build
+must **not** be isolated — `--no-build-isolation` lets it see the env's numpy + cython.
+
+Its legacy `numpy.distutils` backend also has no PEP 660 `build_editable` hook, so an
+editable install needs `--no-use-pep517` (forces the legacy `setup.py develop` path).
+
+BayHunter declares no runtime deps (`install_requires=[]`) but imports `zmq`,
+`configobj` and `PyPDF2` at import time — install those first.
 
 ```bash
+conda install -c conda-forge pyzmq configobj pypdf2 -y   # BayHunter runtime deps
 cd /home/kadek/Documents/software
 git clone https://github.com/jenndrei/BayHunter
-pip install -e /home/kadek/Documents/software/BayHunter   # editable: source stays here
+# editable, legacy backend, no build isolation (source stays in software/):
+pip install -e /home/kadek/Documents/software/BayHunter --no-build-isolation --no-use-pep517
+# --- or, if that errors, a plain (non-editable) install always works: ---
+# pip install /home/kadek/Documents/software/BayHunter --no-build-isolation
 python -c "from BayHunter import Targets, MCMC_Optimizer; print('BayHunter OK')"
 ```
 
-### 4. Stage 7-alt — DSurfTomo (compiled binary, called by path)
+Troubleshooting this build:
+> - `No module named 'numpy'` → you dropped `--no-build-isolation` (isolated build has no numpy).
+> - `No module named 'numpy.distutils'` → env is Python 3.12 or numpy ≥ 2 (redo step 1: 3.11, `numpy<2`).
+> - `missing the 'build_editable' hook` → add `--no-use-pep517` (as above), or use the plain install.
+> - Fortran/C++ errors → ensure `gfortran` + `g++` (step 0) and `setuptools<60` (step 1).
+
+### 4. Stages 5–6 — amb_noise_tools (ANT core, REQUIRED, import-by-path)
+
+The noise cross-correlation (Stage 5) and dispersion picking (Stage 6) are done by
+`amb_noise_tools` (Kaestle). It's pure Python (no build), but has **no packaging
+metadata**, so you do *not* `pip install` it — you put its directory on the import
+path with a `.pth` file (the proper equivalent of an editable install here):
+
+```bash
+cd /home/kadek/Documents/software
+git clone https://github.com/ekaestle/amb_noise_tools
+echo /home/kadek/Documents/software/amb_noise_tools \
+  > "$(python -c 'import site; print(site.getsitepackages()[0])')/amb_noise_tools.pth"
+python -c "import noise; print('amb_noise_tools OK')"
+```
+
+The pipeline also adds this path itself from `ant.amb_noise_tools_dir` in `config.yaml`,
+so the `.pth` is only needed if you want `import noise` outside the pipeline.
+
+### 5. Stage 7-alt — DSurfTomo (compiled binary, called by path)
 
 ```bash
 cd /home/kadek/Documents/software
@@ -168,21 +228,22 @@ dsurftomo:
   binary: /home/kadek/Documents/software/DSurfTomo/src/DSurfTomo
 ```
 
-### 5. Optional extras (only if you need that path)
+### 6. Optional extras (only if you need that path)
 
 ```bash
 cd /home/kadek/Documents/software
 # 8-alt: RfSurfHmc — the paper's exact joint engine (C + Python; build per its README)
 git clone https://github.com/nqdu/RfSurfHmc
 
-# Drop-in alternatives to the built-in Stages 4-6 (not required):
-pip install python-seispy          # Stage 4 CCP / H-kappa
-pip install noisepy-seis           # Stage 5 ANT cross-correlation
-git clone https://github.com/ekaestle/amb_noise_tools && pip install -e ./amb_noise_tools  # Stage 6 FTAN
-# (Full 3-D tomography is DSurfTomo from step 4 — FMST is not used.)
+# Drop-in alternative to the built-in Stage 4 (CCP) — NOT required:
+pip install python-seispy
+# NOTE: noisepy-seis (another Stage-5 tool) requires Python >=3.9,<3.11 and so
+# CANNOT be installed in this env (BayHunter forces 3.11). It is not needed —
+# Stage 5/6 use amb_noise_tools (step 4). Do not try to install noisepy here.
+# (Full 3-D tomography is DSurfTomo from step 5 — FMST is not used.)
 ```
 
-### 6. Point the config at your data
+### 7. Point the config at your data
 
 Edit the `data:` block in [`config.yaml`](config.yaml) for your machine:
 
@@ -196,11 +257,12 @@ Edit the `data:` block in [`config.yaml`](config.yaml) for your machine:
 
 | Want to run | Install steps needed | Where it lives |
 |---|---|---|
-| Stages 1,3,4,5,6,7(B), figures | 0 + 1 | `dieng_rf` env |
+| Stages 1, 3, 4, 7(B), figures | 0 + 1 | `dieng_rf` env |
 | Stage 2 (RF), H-kappa on real RFs | + 2 | `dieng_rf` env |
 | Stage 8 (joint inversion) | + 3 | source in `software/`, env `dieng_rf` |
-| Stage 7-alt (DSurfTomo 3-D) | + 4 | binary in `software/`, called by path |
-| Paper-exact engine (RfSurfHmc) | + 5 | RfSurfHmc in `software/` |
+| Stages 5–6 (ANT + dispersion) | + 4 | `amb_noise_tools` in `software/` (import-by-path) |
+| Stage 7-alt (DSurfTomo 3-D) | + 5 | binary in `software/`, called by path |
+| Paper-exact engine (RfSurfHmc) | + 6 | RfSurfHmc in `software/` |
 
 ## Layout
 

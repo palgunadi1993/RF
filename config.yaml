@@ -138,29 +138,33 @@ ccp:
     - {name: EW, lon1: 109.80, lat1: -7.20, lon2: 110.00, lat2: -7.20, width_km: 10}
 
 # -----------------------------------------------------------------------------
-# STAGE 5 — ambient-noise cross-correlation (NoisePy)
+# STAGE 5 — ambient-noise cross-correlation (amb_noise_tools / Kaestle)
+# The CC core is noise.noisecorr (validated, published). Keys below map to it.
 # -----------------------------------------------------------------------------
 ant:
-  cc_len: 3600                  # s, correlation window
-  cc_step: 1800                 # s, overlap step
-  freq_norm: rma                # spectral whitening method
-  time_norm: one_bit            # temporal normalization
-  freqmin: 0.1
-  freqmax: 5.0
-  maxlag: 100                   # s
-  components: ZZ                # Rayleigh
-  stack_method: pws             # pws (phase-weighted, Schimmel & Paulssen 1997) | linear
-  pws_power: 2.0                # nu exponent on the phase-coherence weight (pws only)
+  amb_noise_tools_dir: /home/kadek/Documents/software/amb_noise_tools  # clone of ekaestle/amb_noise_tools
+  cc_len: 3600                  # s, correlation window (noisecorr window_length)
+  cc_step: 1800                 # s, step -> overlap = 1 - cc_step/cc_len (=0.5 here)
+  freq_norm: rma                # any non-empty value -> whiten=True in noisecorr
+  time_norm: one_bit            # one_bit -> onebit=True in noisecorr
+  water_level: 60               # whitening water level (dB) for noisecorr
+  components: ZZ                # Rayleigh (Z-Z)
   target_sampling_rate: 20      # Hz, downsample before correlation
 
 # -----------------------------------------------------------------------------
-# STAGE 6 — dispersion measurement (amb_noise_tools, FTAN)
+# STAGE 6 — dispersion (amb_noise_tools: velocity_filter + get_smooth_pv)
+# Zero-crossing phase-velocity picking; the 2*pi branch is resolved against
+# ref_curve. Picks are resampled onto `periods` for the joint inversion.
 # -----------------------------------------------------------------------------
 dispersion:
   periods: [0.5, 0.75, 1, 1.5, 2, 3, 4, 5, 6, 8]   # s (node-realistic band)
-  measure: [phase, group]
+  min_vel: 1.5                  # km/s, picking bounds (get_smooth_pv)
+  max_vel: 5.0
+  velband: [5.0, 4.5, 1.5, 1.1] # velocity_filter corners (out,in,in,out) km/s
   min_wavelengths: 2            # reject paths shorter than N wavelengths
-  snr_min: 5.0
+  # ref_curve: Rayleigh phase-velocity guide [[period_s, c_kms], ...]. Defaults to
+  # a generic Dieng-crust curve in dispersion.py; override here if you have one.
+  # ref_curve: [[8,3.2],[5,2.9],[3,2.5],[2,2.2],[1,1.8],[0.5,1.5]]
 
 # -----------------------------------------------------------------------------
 # STAGE 7 — dispersion -> per-station curve
