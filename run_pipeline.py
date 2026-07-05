@@ -8,11 +8,14 @@ dispersion, tomo) are independent and converge at the inversion (PLAN.md).
     python run_pipeline.py --config config.yaml
     python run_pipeline.py --stages rf,hk,ccp
     python run_pipeline.py --stages ant,dispersion,tomo
+    python run_pipeline.py --status              # print where you're standing, run nothing
+    python run_pipeline.py --resume              # skip stages already marked done
 """
 from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -20,7 +23,7 @@ sys.path.insert(0, str(ROOT))
 
 from rf_pipeline import (  # noqa: E402
     ambient_noise, ccp, data_prep, dispersion, dsurftomo, hk_stacking, inversion,
-    receiver_functions, synthesis, tomography,
+    progress, receiver_functions, synthesis, tomography,
 )
 from rf_pipeline.io_utils import load_config  # noqa: E402
 from rf_pipeline.logging_setup import get_logger  # noqa: E402
@@ -45,6 +48,10 @@ def main() -> int:
     ap.add_argument("--config", default=str(ROOT / "config.yaml"))
     ap.add_argument("--stages", default=",".join(STAGES),
                     help=f"Comma-separated subset of: {','.join(STAGES)}")
+    ap.add_argument("--status", action="store_true",
+                    help="Print the current per-stage standing and exit (runs nothing).")
+    ap.add_argument("--resume", action="store_true",
+                    help="Skip stages already marked 'done' in logs/progress.json.")
     args = ap.parse_args()
 
     log = get_logger("orchestrator", log_file=ROOT / "logs" / "pipeline.log")
@@ -56,14 +63,33 @@ def main() -> int:
         log.error(f"Unknown stage(s): {invalid}. Valid: {list(STAGES)}")
         return 2
 
-    log.info(f"Running stages: {selected}")
-    for key in STAGES:                       # preserve canonical order
-        if key not in selected:
-            continue
-        module, label = STAGES[key]
-        log.info(f"=== {label} ===")
-        module.run(cfg)
-    log.info("Pipeline complete.")
+    # --status: just show where things stand, in canonical order, and exit.
+    if args.status:
+        progress.print_status(cfg, selected=[k for k in STAGES if k in selected])
+        return 0
+
+    tracker = progress.ProgressTracker.for_config(cfg)
+    run_order = [k for k in STAGES if k in selected]   # canonical order
+    if args.resume:
+        skipped = [k for k in run_order if tracker.is_done(k)]
+        for k in skipped:
+            log.info(f"--resume: {STAGES[k][1]} already done — skipping.")
+        run_order = [k for k in run_order if k not in skipped]
+
+    total = len(run_order)
+    log.info(f"Running {total} stage(s): {run_order}")
+    t_start = time.time()
+    for i, key in enumerate(run_order, 1):
+        module, _ = STAGES[key]
+        elapsed = time.time() - t_start
+        if i > 1:
+            eta = elapsed / (i - 1) * (total - (i - 1))
+            log.info(f"progress: {i - 1}/{total} stages done, "
+                     f"{progress._fmt_dur(elapsed)} elapsed, ~{progress._fmt_dur(eta)} left")
+        progress.run_stage(cfg, key, module.run, position=i, total=total)
+
+    log.info(f"Pipeline complete in {progress._fmt_dur(time.time() - t_start)}.")
+    progress.print_status(cfg, selected=run_order)
     return 0
 
 

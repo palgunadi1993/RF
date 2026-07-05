@@ -9,7 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from rf_pipeline import synthesis  # noqa: E402
+from rf_pipeline import progress, synthesis  # noqa: E402
 from rf_pipeline.io_utils import load_config  # noqa: E402
 
 
@@ -17,7 +17,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Stage 9 - synthesis & figures")
     ap.add_argument("--config", default=str(ROOT / "config.yaml"))
     args = ap.parse_args()
-    synthesis.run(load_config(args.config))
+    progress.run_stage(load_config(args.config), "synthesis", synthesis.run)
     return 0
 
 

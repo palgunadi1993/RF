@@ -19,7 +19,8 @@ Workers count comes from ``project.n_jobs`` in the config (-1 = all cores).
 from __future__ import annotations
 
 import os
-from concurrent.futures import ProcessPoolExecutor
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from .logging_setup import get_logger
 
@@ -67,24 +68,52 @@ def pmap(fn, tasks: list[tuple], n_jobs: int, desc: str = "") -> list:
     already treat missing per-unit results as "skipped".
     """
     label = desc or getattr(fn, "__name__", "task")
-    if n_jobs <= 1 or len(tasks) <= 1:
+    total = len(tasks)
+    if n_jobs <= 1 or total <= 1:
         out = []
-        for t in tasks:
+        for i, t in enumerate(tasks, 1):
             try:
                 out.append(fn(*t))
             except Exception as e:
                 LOG.warning(f"{label}: task failed ({e!r})")
                 out.append(None)
+            _log_tick(label, i, total)
         return out
 
-    LOG.info(f"{label}: {len(tasks)} tasks on {n_jobs} processes")
-    out = []
+    LOG.info(f"{label}: {total} tasks on {n_jobs} processes")
+    # Preserve task order in the result while still reporting completions as they
+    # arrive: submit in order (remember each future's index), fill results by that
+    # index, and tick the counter every time *any* worker finishes.
+    out: list = [None] * total
     with executor(n_jobs) as ex:
-        futures = [ex.submit(fn, *t) for t in tasks]
-        for fut in futures:
+        fut_index = {ex.submit(fn, *t): i for i, t in enumerate(tasks)}
+        done = 0
+        for fut in as_completed(fut_index):
+            i = fut_index[fut]
             try:
-                out.append(fut.result())
+                out[i] = fut.result()
             except Exception as e:
                 LOG.warning(f"{label}: task failed in worker ({e!r})")
-                out.append(None)
+                out[i] = None
+            done += 1
+            _log_tick(label, done, total)
     return out
+
+
+# Emit an in-stage progress line at ~every 10% (and always the last), so a long
+# per-station/per-pair stage shows "37/126 (29%)" without flooding the log.
+_TICK_STATE: dict[str, tuple[int, float]] = {}
+
+
+def _log_tick(label: str, done: int, total: int) -> None:
+    if total <= 1:
+        return
+    step = max(1, total // 10)
+    last_done, last_t = _TICK_STATE.get(label, (0, 0.0))
+    now = time.time()
+    if done == total or done - last_done >= step or now - last_t >= 30:
+        pct = 100.0 * done / total
+        LOG.info(f"  {label}: {done}/{total} ({pct:.0f}%)")
+        _TICK_STATE[label] = (done, now)
+        if done == total:
+            _TICK_STATE.pop(label, None)

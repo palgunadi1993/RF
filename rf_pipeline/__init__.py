@@ -13,6 +13,7 @@ from __future__ import annotations
 __all__ = [
     "io_utils",
     "logging_setup",
+    "progress",
     "catalogs",
     "data_prep",
     "receiver_functions",

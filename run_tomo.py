@@ -9,7 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from rf_pipeline import tomography  # noqa: E402
+from rf_pipeline import progress, tomography  # noqa: E402
 from rf_pipeline.io_utils import load_config  # noqa: E402
 
 
@@ -17,7 +17,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Stage 7 - dispersion to per-station curves")
     ap.add_argument("--config", default=str(ROOT / "config.yaml"))
     args = ap.parse_args()
-    tomography.run(load_config(args.config))
+    progress.run_stage(load_config(args.config), "tomo", tomography.run)
     return 0
 
 

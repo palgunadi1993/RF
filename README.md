@@ -24,6 +24,27 @@ python run_pipeline.py   --config config.yaml
 python run_pipeline.py   --config config.yaml --stages rf,hk,ccp
 ```
 
+## Knowing where you're standing (progress tracking)
+
+A full real-data run is hours long, so every stage records its own status to
+`logs/progress.json` (source of truth) and a readable `logs/progress.md` mirror —
+`running → done/failed`, with wall-clock start/end, duration and a short note
+(usually the output path). This works whether you launch the whole pipeline or a
+single `run_<stage>.py`; both write the same ten slots.
+
+```bash
+python run_pipeline.py --status          # print the table and exit — run nothing
+python run_pipeline.py --resume          # skip stages already marked 'done'
+watch -n5 'python run_pipeline.py --status'   # live board while a long run churns
+cat logs/progress.md                     # same table, from any other shell
+```
+
+While a stage runs, the orchestrator prints an `i/N` banner and a rolling ETA, and
+the parallel per-station / per-pair stages tick their own `37/126 (29%)` completion
+line (`rf_pipeline/progress.py`, `rf_pipeline/parallel.py`). Progress bookkeeping is
+best-effort: a failure to write the status file is logged and swallowed, never
+allowed to kill a scientific run. `logs/` is git-ignored — it is runtime state.
+
 ## Data model (shared with `repeater_pipeline`)
 
 The 3C reading layer mirrors `repeater_pipeline/pipeline/io_utils.py` so both Dieng
