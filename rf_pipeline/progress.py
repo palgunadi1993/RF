@@ -212,16 +212,36 @@ def run_stage(cfg: dict, key: str, fn, position: int | None = None,
     Used by both the orchestrator and the thin ``run_*.py`` entrypoints so a
     single-stage run updates the same ``logs/progress.json`` as a full run. The
     stage's return value (usually its output ``Path``) is captured as the note.
+
+    After the stage is recorded ``done``, this renders that stage's figures
+    incrementally (unless ``plot.per_stage`` is false), so plots appear as each
+    stage finishes instead of all at Stage 9. Plotting is best-effort: it runs
+    *outside* the timed stage and a plotting failure never flips the stage to
+    failed — the science result is already safe on disk.
     """
     tracker = ProgressTracker.for_config(cfg)
+    note = None
     with tracker.stage(key, position=position, total=total):
         result = fn(cfg)
+        if result is not None:
+            note = f"-> {result}"
+
+    if cfg.get("plot", {}).get("per_stage", True):
         try:
-            if result is not None:
-                tracker.note(key, f"-> {result}")
+            from . import synthesis
+            made = synthesis.plot_for_stage(cfg, key)
+            if made:
+                note = f"{note} | figs: {', '.join(made)}" if note \
+                    else f"figs: {', '.join(made)}"
+        except Exception as e:  # noqa: BLE001 — plotting must never kill a run
+            LOG.warning(f"[{key}] per-stage plotting failed ({e!r})")
+
+    if note:
+        try:
+            tracker.note(key, note)
         except Exception:  # noqa: BLE001 — note is cosmetic
             pass
-        return result
+    return result
 
 
 def print_status(cfg: dict, selected: list[str] | None = None) -> None:

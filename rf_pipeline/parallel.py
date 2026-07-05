@@ -31,16 +31,71 @@ _BLAS_ENV = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
              "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS")
 
 
-def resolve_n_jobs(cfg: dict, n_tasks: int | None = None) -> int:
-    """``project.n_jobs``: -1/0/unset = all cores; clamped to [1, n_tasks]."""
+def _available_ram_gb() -> float | None:
+    """Best-effort free RAM in GiB, or None if it can't be determined.
+
+    Prefers Linux ``/proc/meminfo`` (``MemAvailable`` — the kernel's own estimate
+    of what a new workload can grab, which already accounts for reclaimable cache),
+    then ``psutil`` if it happens to be installed. Returns None on anything else so
+    the memory cap simply doesn't apply rather than guessing wrong.
+    """
     try:
-        n = int(cfg.get("project", {}).get("n_jobs", -1))
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / (1024.0 ** 2)   # kB -> GiB
+    except OSError:
+        pass
+    try:
+        import psutil  # type: ignore
+        return psutil.virtual_memory().available / (1024.0 ** 3)
+    except Exception:  # noqa: BLE001 — psutil optional; absence is fine
+        return None
+
+
+def resolve_n_jobs(cfg: dict, n_tasks: int | None = None) -> int:
+    """Worker count from ``project.n_jobs``, clamped by tasks *and* free RAM.
+
+    - ``project.n_jobs``: -1/0/unset = all cores; a positive value is a hard ceiling.
+    - clamped to ``[1, n_tasks]`` so we never spawn more workers than there is work.
+    - clamped so ``workers * project.mem_per_worker_gb`` fits in currently-available
+      RAM (minus ``project.mem_headroom_gb`` reserved for the parent + OS). This is
+      what stops an ``n_jobs: -1`` all-cores RF run from spawning 18 ObsPy workers on
+      a box that's already deep in swap and getting OOM-killed. Defaults: 2.0 GB per
+      worker, 2.0 GB headroom. Set ``mem_per_worker_gb: 0`` to disable the RAM cap.
+    """
+    proj = cfg.get("project", {}) or {}
+    try:
+        n = int(proj.get("n_jobs", -1))
     except (TypeError, ValueError):
         n = -1
     if n <= 0:
         n = os.cpu_count() or 1
     if n_tasks is not None:
         n = min(n, max(1, int(n_tasks)))
+
+    # memory-aware cap
+    try:
+        per_worker = float(proj.get("mem_per_worker_gb", 2.0))
+    except (TypeError, ValueError):
+        per_worker = 2.0
+    try:
+        headroom = float(proj.get("mem_headroom_gb", 2.0))
+    except (TypeError, ValueError):
+        headroom = 2.0
+    if per_worker > 0:
+        avail = _available_ram_gb()
+        if avail is not None:
+            usable = max(0.0, avail - headroom)
+            mem_cap = max(1, int(usable // per_worker))
+            if mem_cap < n:
+                LOG.info(
+                    f"n_jobs capped {n} -> {mem_cap} by free RAM "
+                    f"({avail:.1f} GiB avail - {headroom:.0f} reserved, "
+                    f"{per_worker:.1f} GiB/worker). Tune project.mem_per_worker_gb."
+                )
+                n = mem_cap
+
     return max(1, n)
 
 

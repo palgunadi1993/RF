@@ -304,6 +304,105 @@ def F8_ccf_gather(cfg):
 
 
 # --------------------------------------------------------------------------
+# F13 — pair dispersion curves (Stage 6 output: ant/disp/*.disp)
+# --------------------------------------------------------------------------
+
+def _load_disp(f: Path):
+    """Load a ``period phase_vel group_vel sigma`` table; None if empty/unreadable."""
+    try:
+        arr = np.loadtxt(f, ndmin=2)
+    except Exception:
+        return None
+    if arr.size == 0 or arr.shape[1] < 2:
+        return None
+    return arr[np.argsort(arr[:, 0])]           # ascending period
+
+
+def F13_dispersion_pair_curves(cfg):
+    """Every station-pair Rayleigh phase-velocity curve + a median/16-84 envelope."""
+    plt = _mpl()
+    p = io_utils.paths(cfg)
+    disp_dir = p.get("disp")
+    files = sorted(Path(disp_dir).glob("*.disp")) if disp_dir else []
+    if not files:
+        LOG.warning("F13: no pair .disp curves (run Stage 6) — skipping.")
+        return
+    from collections import defaultdict
+    by_T = defaultdict(list)
+    fig, ax = plt.subplots(figsize=(7, 5))
+    n_pairs = 0
+    for f in files:
+        arr = _load_disp(f)
+        if arr is None:
+            continue
+        T, c = arr[:, 0], arr[:, 1]
+        ax.plot(T, c, color="0.7", lw=0.6, alpha=0.6, zorder=1)
+        for Ti, ci in zip(T, c):
+            by_T[round(float(Ti), 4)].append(float(ci))
+        n_pairs += 1
+    if n_pairs == 0:
+        LOG.warning("F13: pair .disp files present but empty — skipping.")
+        return
+    Ts = sorted(by_T)
+    med = [np.median(by_T[T]) for T in Ts]
+    lo = [np.percentile(by_T[T], 16) for T in Ts]
+    hi = [np.percentile(by_T[T], 84) for T in Ts]
+    ax.fill_between(Ts, lo, hi, color="tab:blue", alpha=0.2, zorder=2,
+                    label="16–84th percentile")
+    ax.plot(Ts, med, color="tab:blue", lw=2.2, zorder=3, label="median")
+    ax.set_xlabel("Period (s)"); ax.set_ylabel("Phase velocity (km/s)")
+    ax.set_title(f"Rayleigh phase-velocity dispersion — {n_pairs} station pairs")
+    ax.legend()
+    fig.tight_layout()
+    _save(fig, "F13_dispersion_pair_curves", cfg)
+
+
+# --------------------------------------------------------------------------
+# F14 — per-station dispersion curves (Stage 7 output: tomo/*_disp.txt)
+# --------------------------------------------------------------------------
+
+def F14_dispersion_station_curves(cfg):
+    """Two-station-average curve per station (σ band), over the faint pair cloud."""
+    plt = _mpl()
+    p = io_utils.paths(cfg)
+    tomo_dir = p.get("tomo")
+    files = sorted(Path(tomo_dir).glob("*_disp.txt")) if tomo_dir else []
+    if not files:
+        LOG.warning("F14: no per-station curves (run Stage 7) — skipping.")
+        return
+    fig, ax = plt.subplots(figsize=(7, 5))
+    # faint backdrop: the raw pair curves this average was built from (context).
+    disp_dir = p.get("disp")
+    if disp_dir and Path(disp_dir).exists():
+        for f in sorted(Path(disp_dir).glob("*.disp")):
+            arr = _load_disp(f)
+            if arr is not None:
+                ax.plot(arr[:, 0], arr[:, 1], color="0.85", lw=0.5, zorder=1)
+    cmap = plt.get_cmap("turbo")
+    n = 0
+    for i, f in enumerate(files):
+        arr = _load_disp(f)
+        if arr is None:
+            continue
+        T, c = arr[:, 0], arr[:, 1]
+        colour = cmap(i / max(1, len(files) - 1))
+        ax.plot(T, c, color=colour, lw=1.5, marker="o", ms=3, zorder=3,
+                label=f.stem.replace("_disp", ""))
+        if arr.shape[1] > 3:
+            sig = arr[:, 3]
+            ax.fill_between(T, c - sig, c + sig, color=colour, alpha=0.15, zorder=2)
+        n += 1
+    if n == 0:
+        LOG.warning("F14: per-station curve files present but empty — skipping.")
+        return
+    ax.set_xlabel("Period (s)"); ax.set_ylabel("Phase velocity (km/s)")
+    ax.set_title(f"Per-station dispersion (two-station average) — {n} stations")
+    ax.legend(fontsize=6, ncol=2 if n > 12 else 1, loc="best")
+    fig.tight_layout()
+    _save(fig, "F14_dispersion_station_curves", cfg)
+
+
+# --------------------------------------------------------------------------
 # F9 — dispersion maps (path A only)
 # --------------------------------------------------------------------------
 
@@ -442,19 +541,80 @@ _FIGURES = {
     "F10_inversion_per_station": F10_inversion_per_station,
     "F11_vs_cross_sections": F11_vs_cross_sections,
     "F12_structural_model": F12_structural_model,
+    "F13_dispersion_pair_curves": F13_dispersion_pair_curves,
+    "F14_dispersion_station_curves": F14_dispersion_station_curves,
 }
+
+# Which figures become drawable the moment a given stage's outputs land. Used to
+# render incrementally (a figure right after its data exists) instead of deferring
+# every plot to Stage 9. Keyed by the orchestrator's stage keys; a figure is only
+# ever rendered once its own inputs are present (each figure self-skips otherwise),
+# so listing it here is safe even if the stage produced nothing.
+STAGE_FIGURES: dict[str, list[str]] = {
+    "prep":       ["F1_station_map", "F2_event_distribution"],
+    "rf":         ["F6_rf_record_sections"],
+    "hk":         ["F4_hk_panels", "F5_hk_summary"],
+    "ccp":        ["F7_ccp_sections"],
+    "ant":        ["F3_coverage_raypaths", "F8_ccf_gather"],
+    "dispersion": ["F13_dispersion_pair_curves"],
+    "tomo":       ["F14_dispersion_station_curves"],
+    "dsurftomo":  ["F9_dispersion_maps"],
+    "inversion":  ["F10_inversion_per_station", "F11_vs_cross_sections",
+                   "F12_structural_model"],
+    "synthesis":  [],                       # Stage 9 renders the full set below
+}
+
+
+def _fig_mtimes(fig_dir: Path) -> dict[str, float]:
+    return {f.name: f.stat().st_mtime for f in Path(fig_dir).glob("*") if f.is_file()}
+
+
+def _render(cfg: dict, names) -> list[str]:
+    """Render the named figures that are toggled on; return those actually drawn.
+
+    Each figure degrades gracefully (logs a skip and writes nothing) when its
+    inputs are missing, so this is safe to call after any stage, in any order.
+    "Actually drawn" is detected by a change in the ``figures/`` directory around
+    each call — not by the function returning — so a figure that self-skips is
+    honestly reported as *not* made, even though it raised no error. (Detection is
+    by output file, since some figures save under a different name than their
+    toggle, e.g. F9_dispersion_maps -> F9_vs_depth_slices.)
+    """
+    p = io_utils.paths(cfg)
+    fig_dir = io_utils.ensure_dir(p["figures"])
+    toggles = cfg.get("plot", {}).get("figures", {})
+    made: list[str] = []
+    for name in names:
+        fn = _FIGURES.get(name)
+        if fn is None or not toggles.get(name, False):
+            continue
+        before = _fig_mtimes(fig_dir)
+        try:
+            fn(cfg)
+        except Exception as e:
+            LOG.warning(f"{name}: failed ({e}).")
+            continue
+        after = _fig_mtimes(fig_dir)
+        if any(after.get(k) != before.get(k) for k in set(after) | set(before)):
+            made.append(name)
+    return made
+
+
+def plot_for_stage(cfg: dict, stage_key: str) -> list[str]:
+    """Render just the figures whose data becomes available after ``stage_key``.
+
+    Called from the pipeline's per-stage hook (``progress.run_stage``) so plots
+    appear incrementally. Returns the names actually drawn (may be empty).
+    """
+    made = _render(cfg, STAGE_FIGURES.get(stage_key, []))
+    if made:
+        LOG.info(f"[{stage_key}] rendered {made}")
+    return made
 
 
 def run(cfg: dict) -> Path:
     p = io_utils.paths(cfg)
     out_dir = io_utils.ensure_dir(p["figures"])
-    toggles = cfg.get("plot", {}).get("figures", {})
-    for name, fn in _FIGURES.items():
-        if not toggles.get(name, False):
-            continue
-        try:
-            fn(cfg)
-        except Exception as e:
-            LOG.warning(f"{name}: failed ({e}).")
+    _render(cfg, list(_FIGURES))            # Stage 9: (re)render the complete set
     LOG.info("Stage 9 (synthesis) complete.")
     return out_dir

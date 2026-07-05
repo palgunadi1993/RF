@@ -28,7 +28,15 @@ project:
   # Used by Stage 2 (per station), Stage 5 (per day), Stage 6 (per pair); Stage 8
   # runs n_jobs // inversion.mcmc.chains stations at once (BayHunter already
   # parallelizes its chains). Set 1 to force the old fully-serial behaviour.
-  n_jobs: -1
+  n_jobs: 4
+  # Memory-aware cap on the worker count (safety net for n_jobs: -1). Workers are
+  # reduced so `workers * mem_per_worker_gb` fits in currently-free RAM minus
+  # `mem_headroom_gb`, using the kernel's MemAvailable at launch. This is what keeps
+  # an all-cores Stage-2 run from spawning enough ObsPy workers to get OOM-killed on
+  # a memory-tight box. Raise mem_per_worker_gb if a stage still swaps; set it to 0
+  # to disable the cap. Defaults if omitted: 2.0 GB/worker, 2.0 GB headroom.
+  mem_per_worker_gb: 2.0
+  mem_headroom_gb: 2.0
 
 # -----------------------------------------------------------------------------
 # STAGE 1 — data / event catalogs (one block per source class; all three used)
@@ -240,6 +248,11 @@ inversion:
 # STAGE 9 — synthesis / plotting
 # -----------------------------------------------------------------------------
 plot:
+  # Render each stage's figures as soon as that stage finishes (incremental), so
+  # you see results while the pipeline is still running instead of only at Stage 9.
+  # The mapping stage->figures lives in synthesis.STAGE_FIGURES; Stage 9 still
+  # (re)renders the complete set. Set false to defer ALL plotting to Stage 9.
+  per_stage: true
   # ---- global styling (publication standards) ----
   dpi: 300
   format: [png, svg]            # vector + raster; add pdf if needed
@@ -266,6 +279,8 @@ plot:
     F10_inversion_per_station: true
     F11_vs_cross_sections: true
     F12_structural_model: true
+    F13_dispersion_pair_curves: true    # Stage 6: all station-pair phase-vel curves
+    F14_dispersion_station_curves: true # Stage 7: two-station-average per-station curves
   # ---- figure-specific params ----
   cross_sections: [NS, EW]
   vs_slice_depths_km: [2, 5, 10, 20]       # F9 Vs depth slices (tomo.path == A)

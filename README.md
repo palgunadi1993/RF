@@ -45,6 +45,72 @@ line (`rf_pipeline/progress.py`, `rf_pipeline/parallel.py`). Progress bookkeepin
 best-effort: a failure to write the status file is logged and swallowed, never
 allowed to kill a scientific run. `logs/` is git-ignored — it is runtime state.
 
+## Figures as each stage finishes (incremental plotting)
+
+By default the figures a stage feeds are rendered **the moment that stage finishes**,
+not deferred to Stage 9 — so you can eyeball H-kappa panels while the noise side is
+still cross-correlating. Nothing extra to run: any stage launched through
+`run_pipeline.py` **or** a single `run_<stage>.py` draws its own figures on
+completion. The map of which figure follows which stage is
+`synthesis.STAGE_FIGURES`:
+
+| Finishing stage | Figures drawn |
+|---|---|
+| `prep` | F1 station map, F2 event distribution |
+| `rf` | F6 RF record sections |
+| `hk` | F4 H-κ panels, F5 H-κ summary |
+| `ccp` | F7 CCP sections |
+| `ant` | F3 ray-path coverage, F8 CCF gather |
+| `dispersion` | F13 pair phase-velocity curves (+ median/percentile envelope) |
+| `tomo` | F14 per-station dispersion curves (two-station average, σ bands) |
+| `dsurftomo` | F9 Vs depth slices |
+| `inversion` | F10 per-station inversion, F11 Vs cross-sections, F12 structural model |
+
+```bash
+python run_pipeline.py --config config.yaml   # figures appear stage-by-stage in figures/
+python run_hk.py --config config.yaml         # just Stage 3 -> writes F4 + F5 immediately
+ls figures/                                   # watch it fill up as the run progresses
+```
+
+To **re-draw one stage's figures from data already on disk** (no recomputation of the
+science — handy after tweaking a plot or a colour), use `run_synthesis.py --stages`:
+
+```bash
+python run_synthesis.py --stages dispersion       # only Stage 6's figure (F13)
+python run_synthesis.py --stages dispersion,tomo  # Stages 6 & 7 (F13, F14)
+python run_synthesis.py --list                    # print the stage->figure map
+python run_synthesis.py                           # render the complete set (Stage 9)
+```
+
+Each figure still self-skips (logs a skip, writes nothing) when its inputs are not
+present yet, and only figures that *actually wrote a file* are reported as drawn.
+Plotting runs **after** the stage is recorded `done`, outside its timed window, and a
+plot failure never flips the stage to failed — the science result is already on disk.
+Stage 9 (`run_synthesis.py`) still (re)renders the **complete** set as the final pass.
+To go back to the old behaviour (all plots at the end only), set `plot.per_stage: false`
+in `config.yaml`; per-figure `plot.figures.*` toggles are still honoured either way.
+
+## Keeping parallel stages inside your RAM budget
+
+`project.n_jobs` sets the worker-process count (`-1` = all cores). Because each
+`spawn` worker re-imports ObsPy/`rf`/NumPy fresh and holds its own data, an all-cores
+run of a heavy stage (Stage 2 especially) can exhaust memory and get OOM-killed. So
+the worker count is now also capped so that `workers × mem_per_worker_gb` fits in the
+RAM free *at launch* (kernel `MemAvailable`) minus `mem_headroom_gb` reserved for the
+parent + OS:
+
+```yaml
+project:
+  n_jobs: 4               # hard ceiling; -1 = all cores
+  mem_per_worker_gb: 2.0  # raise if a stage still swaps; 0 disables the RAM cap
+  mem_headroom_gb: 2.0    # RAM held back for the parent + OS
+```
+
+When RAM is the binding constraint the log says so, e.g.
+`n_jobs capped 22 -> 5 by free RAM (49.7 GiB avail - 2 reserved, 8.0 GiB/worker)`.
+The cap only ever *lowers* the count — an explicit small `n_jobs` (e.g. `4`) is still
+the surest control on a memory-tight machine.
+
 ## Data model (shared with `repeater_pipeline`)
 
 The 3C reading layer mirrors `repeater_pipeline/pipeline/io_utils.py` so both Dieng
