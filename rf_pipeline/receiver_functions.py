@@ -24,6 +24,7 @@ Outputs per station/class:
 """
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -32,6 +33,20 @@ from . import catalogs, io_utils, parallel
 from .logging_setup import get_logger
 
 LOG = get_logger("rf.receiver_functions")
+
+# rf.rfstats looks up the P onset with TauP. In the upper-mantle triplication band
+# (~14-24 deg — regional events off the 410/660 discontinuities) TauP returns
+# several P branches, and rf warns before taking arrivals[0]. That first arrival is
+# the earliest = direct P, which IS the correct RF onset (and its ray parameter),
+# so the choice is right; only the per-event warning is noise. Silence just that one
+# message (matched on text) so it doesn't flood the log — every other warning still
+# shows. The filter is set at import, so it also applies inside the spawn workers,
+# which re-import this module. See the regional class notes in config.yaml.
+warnings.filterwarnings(
+    "ignore",
+    message="TauPy returns more than one arrival",
+    category=UserWarning,
+)
 
 
 def _require_rf():
@@ -138,6 +153,25 @@ def _resolve_tt_model(cfg, params, name) -> str:
         return params.get("tt_model", "iasp91")
 
 
+def _is_dead(tr) -> bool:
+    """True if a trace can't be deconvolved: empty, non-finite, or flat.
+
+    A flat (all-zero / constant) component — a dead sensor or a zero-filled gap
+    from ``read_event_window_3c``'s ``merge(fill_value=0)`` — deconvolves to an
+    all-zero RF. ``rf`` then normalizes every component by ``1/max(|parent RF|)``,
+    so a dead parent gives ``norm = inf`` and turns the whole event's RFs into
+    NaN (the ``divide by zero`` / ``invalid value`` RuntimeWarnings from
+    rf.deconvolve). Dropping such events up front avoids the warning, the wasted
+    deconvolution, and any chance of a NaN RF reaching the stack.
+    """
+    d = getattr(tr, "data", None)
+    if d is None or d.size == 0:
+        return True
+    if not np.all(np.isfinite(d)):
+        return True
+    return float(np.ptp(d)) == 0.0            # exactly flat -> dead/zero-filled
+
+
 def _snr(tr, onset, signal=(-2.0, 8.0), noise=(-25.0, -5.0)) -> float:
     """RMS SNR of an RF trace: signal window vs pre-onset noise, about ``onset``."""
     from obspy import UTCDateTime
@@ -146,6 +180,10 @@ def _snr(tr, onset, signal=(-2.0, 8.0), noise=(-25.0, -5.0)) -> float:
     sig = tr.slice(t0 + signal[0], t0 + signal[1]).data
     noi = tr.slice(t0 + noise[0], t0 + noise[1]).data
     if sig.size == 0 or noi.size == 0:
+        return 0.0
+    # A NaN/Inf RF (e.g. a deconvolution that blew up) must never pass QC; reject
+    # it outright rather than let a zero noise-RMS return inf below.
+    if not (np.all(np.isfinite(sig)) and np.all(np.isfinite(noi))):
         return 0.0
     nrms = float(np.sqrt(np.mean(noi ** 2)))
     if nrms == 0:
@@ -221,6 +259,12 @@ def _station_task(ctx: dict, sta, cat, inv, index, out_dir: Path):
                                    pre_filt=ctx["pre_filt"], water_level=60)
             except Exception as e:
                 LOG.debug(f"[{name}] {sta.code} response removal failed: {e}")
+        # skip events with a dead/flat component — they would make rf's iterative
+        # deconvolution divide by zero and NaN out the whole event (see _is_dead).
+        if any(_is_dead(tr) for tr in st):
+            LOG.debug(f"[{name}] {sta.code}: dead/flat component at "
+                      f"{getattr(origin, 'time', '?')} — skipping event.")
+            continue
         for tr in st:
             tr.stats.update(stats)
         stream.extend(st)
