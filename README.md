@@ -24,6 +24,27 @@ python run_pipeline.py   --config config.yaml
 python run_pipeline.py   --config config.yaml --stages rf,hk,ccp
 ```
 
+## Testing Stage 2 on one station first
+
+A full receiver-function run is 43 stations × 3 source classes (hours, dominated by
+reading windows off the external drive). Before committing to that, validate the
+config end-to-end on a single station — `run_rf.py` takes `--stations` and `--classes`:
+
+```bash
+python run_rf.py --stations ST01 --classes teleseismic   # one station, one class (~7 min)
+python run_rf.py --stations ST01                          # one station, all 3 classes
+python run_rf.py --stations ST01,ST05,ST09                # a few stations
+python run_rf.py                                          # every station, every class (full run)
+```
+
+- `--classes` accepts `teleseismic`, `regional`, `local_deep` (comma-separated); omit for all.
+- Pass only station codes that exist **in the waveform data** — some `station.txt` codes
+  have metadata but no waveforms and would produce nothing. A one-station teleseismic
+  run should report e.g. `ST01: 122 events -> 64 RFs, stacked -> ST01_teleseismic_stack.sac`
+  and write `rf_out/ST01_teleseismic.h5` + `_stack.sac`; figure **F6** auto-renders.
+- Prefer a persistent setting? Add `only_stations: [ST01]` under `data:` in `config.yaml`
+  (the `--stations` flag overrides it).
+
 ## Knowing where you're standing (progress tracking)
 
 A full real-data run is hours long, so every stage records its own status to

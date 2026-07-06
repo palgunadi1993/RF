@@ -273,6 +273,16 @@ def _station_task(ctx: dict, sta, cat, inv, index, out_dir: Path):
     if len(stream) == 0:
         return (sta.code, 0, 0, 0, None)
 
+    # CRITICAL: rewrap as RFTrace before .rf(). We accumulated plain ObsPy Traces
+    # (from read_event_window_3c) into the RFStream via extend(), which does NOT
+    # convert them — only RFStream(traces) does. If they stay plain Traces, rf's
+    # RFStream.select() (called inside .rf() for the NE->RT rotation) returns
+    # RFTrace *copies* instead of references, so the in-place rotation mutates
+    # throwaways and the real traces are never rotated -> zero radial RFs ->
+    # every station reports "no usable events". Wrapping here makes them RFTrace
+    # so select() returns the real traces and rotation sticks.
+    stream = RFStream(stream)
+
     # rotate + deconvolve -> RFs. f1/f2 are a bandpass applied before
     # deconvolution (rf's `filter` kwarg); the iterative time-domain
     # deconvolution takes gauss/itmax/minderr (verified against rf source:
@@ -387,6 +397,18 @@ def run(cfg: dict) -> Path:
     p = io_utils.paths(cfg)
     out_dir = io_utils.ensure_dir(p["rf_out"])
 
+    # optional station subset: run_rf.py --stations, or data.only_stations in the
+    # config. Handy for a quick single-station test before a full multi-hour run.
+    only = cfg.get("_only_stations") or cfg.get("data", {}).get("only_stations")
+    if only:
+        want = {str(s).upper() for s in only}
+        stations = [s for s in stations if s.code.upper() in want]
+        LOG.info(f"Station filter: {sorted(s.code for s in stations)} "
+                 f"(requested {sorted(want)}).")
+        if not stations:
+            LOG.warning(f"No stations match {sorted(want)} — nothing to do.")
+            return out_dir
+
     # index continuous data once for fast per-event windowing
     src = cfg.get("data", {}).get("source_waveform_dir")
     scan_dir = io_utils.resolve_path(src, cfg["_project_root"]) if src else p["continuous"]
@@ -397,7 +419,10 @@ def run(cfg: dict) -> Path:
 
     n_jobs = parallel.resolve_n_jobs(cfg, n_tasks=len(stations))
     classes = cfg.get("rf", {}).get("classes", {}) or {}
+    only_classes = {str(c).lower() for c in (cfg.get("_only_classes") or [])}
     for name, class_cfg in classes.items():
+        if only_classes and name.lower() not in only_classes:
+            continue
         # honour the per-class catalog toggle
         if not (cfg.get("catalogs", {}).get(name, {}).get("enabled", True)):
             LOG.info(f"[{name}] catalog disabled — skipping RF class.")
