@@ -212,7 +212,13 @@ def F6_rf_record_sections(cfg):
         return
     p = io_utils.paths(cfg)
     classes = list(cfg.get("rf", {}).get("classes", {}).keys())
-    reps = cfg.get("plot", {}).get("representative_stations", [])
+    # Station selection. An explicit override wins — either run_synthesis.py
+    # --rf-stations (cfg["_rf_stations"]) or plot.rf_stations in the config —
+    # so any station can be plotted by name; otherwise fall back to the shared
+    # representative_stations used by the other per-station panels.
+    override = cfg.get("_rf_stations") or cfg.get("plot", {}).get("rf_stations")
+    reps = override or cfg.get("plot", {}).get("representative_stations", [])
+    reps = [str(s).strip().upper() for s in reps if str(s).strip()]
     files = []
     for sta in reps:
         for cls in classes:
@@ -220,7 +226,8 @@ def F6_rf_record_sections(cfg):
             if f.exists():
                 files.append((sta, cls, f))
     if not files:
-        LOG.warning("F6: no RF H5 for representative stations — skipping.")
+        LOG.warning(f"F6: no RF H5 found for stations {reps} in {p['rf_out']} "
+                    f"— skipping.")
         return
     fig, axes = plt.subplots(1, len(files), figsize=(4 * len(files), 6), squeeze=False)
     for ax, (sta, cls, f) in zip(axes[0], files):
@@ -237,7 +244,13 @@ def F6_rf_record_sections(cfg):
         ax.set_xlim(-2, 20)
     axes[0][0].set_ylabel("RF index (baz-sorted)")
     fig.tight_layout()
-    _save(fig, "F6_rf_record_sections", cfg)
+    # Keep the default (representative-station) figure under its canonical name so
+    # the pipeline overwrites it in place; a by-name request gets a station-tagged
+    # name so it never clobbers that shared figure.
+    name = "F6_rf_record_sections"
+    if override:
+        name += "_" + "_".join(reps)
+    _save(fig, name, cfg)
 
 
 # --------------------------------------------------------------------------
