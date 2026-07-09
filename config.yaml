@@ -112,7 +112,12 @@ rf:
   classes:
     teleseismic:
       rotate: ZNE->RT
-      gauss: 1.5                 # Gaussian width a (~<=1 Hz)
+      # Paper (Criado-Sutti et al. 2026) deconvolution for the teleseismic Moho
+      # H-k: water-level, Gaussian a=0.5, c=0.1, band 0.01-2 Hz. Low-frequency +
+      # water-level gives smooth, coherently-stacking RFs -> a tight Fig. 3 peak.
+      deconvolve: freqattr        # water-level (rf 'waterlevel')
+      gauss: 0.5                  # Gaussian width a (paper)
+      deconv_params: {f1: 0.01, f2: 2.0, waterlevel: 0.1}
       slowness_range: [0.04, 0.08]   # s/km (compared after s/deg -> s/km conversion)
     regional:
       rotate: ZNE->RT
@@ -133,11 +138,18 @@ rf:
 hk:
   vp_crust: 6.0                 # km/s assumed
   h_range:  [0, 70]             # km
-  h_step:   2.0
+  h_step:   0.25                # fine grid -> smooth stack (paper-style, many trials)
   k_range:  [1.6, 2.5]
-  k_step:   0.05
+  k_step:   0.005              # 0.5 km x 0.005 Vp/Vs -> ~281 x 181 trial points
   weights:  [0.6, 0.3, 0.1]     # Ps, PpPs, PsPs amplitude weights
-  run_on: [local_deep, teleseismic]   # order shallow->deep for the depth correction
+  run_on: [local_deep, regional, teleseismic]   # order shallow->deep for the depth correction
+  # Per-class search-grid overrides (fall back to the globals above). local_deep
+  # events sample crust-to-Moho; capping H well below the teleseismic range keeps
+  # the stack from locking onto a crustal multiple ~50-56 km down (a false 'Moho').
+  # Dieng Moho is ~30-35 km, so 45 km leaves headroom above the multiple band.
+  class_overrides:
+    local_deep:
+      h_range: [0, 45]          # km — clip the deep-multiple degeneracy
   depth_correct_k: true         # recursive k correction (paper App. A, Eq. A6)
   # correction_layers: one {vp, thick_km} per class in run_on (shallow->deep; the
   # code reverses to Eq. A1's deepest-first indexing internally). The per-class
@@ -153,10 +165,16 @@ hk:
 # STAGE 4 — CCP migration (seispy)
 # -----------------------------------------------------------------------------
 ccp:
-  velocity_model: data/ccp_model.txt
+  velocity_model: /home/kadek/Documents/ITS/collaboration/Dieng/repeater_pipeline/config/velocity_models/dieng_velest_min1d.txt
   depth_range: [0, 60]          # km
   depth_step: 0.5
-  run_on: [teleseismic, local_deep]
+  # Along-profile binning (paper Fig. 6 style). along_step = bin centre spacing;
+  # bin_km = overlapping support window (moving-window CCP stack). Dense centres +
+  # overlap give continuous, non-blocky sections while every bin stays a real mean
+  # of migrated amplitudes. Set bin_km == along_step for hard, non-overlapping bins.
+  along_step: 0.5               # km between bin centres
+  bin_km: 2.0                   # km along-profile averaging support
+  run_on: [teleseismic, regional, local_deep]
   profiles:
     - {name: NS, lon1: 109.85, lat1: -7.10, lon2: 109.95, lat2: -7.30, width_km: 10}
     - {name: EW, lon1: 109.80, lat1: -7.20, lon2: 110.00, lat2: -7.20, width_km: 10}
@@ -285,4 +303,34 @@ plot:
   cross_sections: [NS, EW]
   vs_slice_depths_km: [2, 5, 10, 20]       # F9 Vs depth slices (tomo.path == A)
   representative_stations: [ST01, ST05]    # F4 / F10 example panels (DG codes)
-  ccf_bandpass: [0.2, 0.4]                 # Hz, F8 gather
+  # ---- F8 CCF gather ----
+  # Band matters (verified by slant-stack semblance + per-pair image, 2026-07-09):
+  # 0.5-1.5 Hz is scattered to incoherent speckle by the volcanic edifice -> NO moveout.
+  # The coherent, dispersive surface wave lives at 0.3-0.8 Hz, apparent velocity ~2-3 km/s
+  # (semblance peak/median ~2.5x at ~2.5 km/s once the stationary zero-lag lobe is excluded).
+  ccf_bandpass: [0.3, 0.8]                 # Hz, F8 gather (low band = coherent moveout)
+  ccf_symmetric: false                     # true: fold causal+acausal -> one-sided EGF (+sqrt2 SNR,
+                                           #       half-width panel, crisp moveout — MSNoise standard)
+                                           # false: two-sided gather (acausal at -lag, causal at +lag;
+                                           #        lets you check causal/acausal symmetry = noise balance)
+  ccf_zero_lag_mute: 1.0                   # s, Gaussian taper of the stationary zero-lag lobe that
+                                           # otherwise dominates and masks the moving-out packet
+  ccf_dist_bin_km: 0.75                    # stack pairs into distance bins; 0 = per pair (raw, noisy)
+  ccf_min_pairs: 2                         # drop distance bins with fewer pairs (undersampled far offsets)
+  ccf_pws: 1.0                             # phase-weighted-stack power (nu); 0 = plain linear stack.
+                                           # nu=1 suppresses incoherent volcanic scatter -> cleaner moveout
+                                           # (nu=2 over-thins and fragments arrivals on this dataset)
+  ccf_row_norm: true                       # renormalize each bin to unit amplitude before drawing
+                                           # (equalizes row heights; required so PWS bins stay visible)
+  ccf_fill: true                           # variable-area fill of positive lobes -> moveout pops
+  ccf_fill_color: k                        # fill colour (black = seismic standard)
+  ccf_gain: 0.9                            # wiggle amplitude multiplier (<=1.0 keeps rows from overlapping)
+  ccf_clip: 1.0                            # clip normalized amplitude before scaling (tames noisy bins)
+  ccf_ampli: null                          # km per unit amplitude (MSNoise 'ampli'); null = auto (bin spacing)
+  ccf_lag_max: 14                          # s, cropped lag window (moveout reaches ~dmax/2 km/s); null = auto
+  ccf_v_min: 1.0                           # km/s, slowest wave -> sets the auto window when ccf_lag_max: null
+  ccf_ref_vels: [2.0, 3.0]                 # km/s constant-velocity moveout guides (bracket the ~2.5 km/s packet)
+  ccf_annotate_n: true                     # label each row with its pair count (explains far-offset noise)
+  # ---- F7 CCP sections ----
+  ccp_clim: 0.2                            # symmetric colour limit (mean norm amp)
+  ccp_max_depth: 25                        # crop plotted depth (km); null = full

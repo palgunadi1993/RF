@@ -37,9 +37,18 @@ def _save(fig_or_pygmt, name, cfg, is_pygmt=False):
     out_dir = io_utils.ensure_dir(p["figures"])
     dpi = int(cfg.get("plot", {}).get("dpi", 300))
     fmts = cfg.get("plot", {}).get("format", ["png"])
+    # PyGMT's savefig can't write SVG; fall back to PDF (also vector, GMT-native).
+    pygmt_ok = {"png", "pdf", "jpg", "bmp", "eps", "tif", "tiff", "kml", "ppm"}
+    pygmt_alt = {"svg": "pdf"}
     written = []
     for fmt in fmts:
-        target = out_dir / f"{name}.{fmt}"
+        out_fmt = fmt
+        if is_pygmt and fmt not in pygmt_ok:
+            out_fmt = pygmt_alt.get(fmt)
+            if out_fmt is None:
+                LOG.warning(f"{name}: pygmt cannot write .{fmt} — skipping that format")
+                continue
+        target = out_dir / f"{name}.{out_fmt}"
         if is_pygmt:
             fig_or_pygmt.savefig(str(target), dpi=dpi)
         else:
@@ -159,13 +168,22 @@ def F4_hk_panels(cfg):
     fig, axes = plt.subplots(1, n, figsize=(4 * n, 4), squeeze=False)
     for ax, npz in zip(axes[0], npzs):
         d = np.load(npz)
-        im = ax.pcolormesh(d["k_grid"], d["h_grid"], d["stack"], cmap="viridis",
-                           shading="auto")
-        ax.plot(d["bestK"], d["bestH"], "r*", ms=14)
-        ax.invert_yaxis()
-        ax.set_xlabel("Vp/Vs"); ax.set_ylabel("H (km)")
+        # H on the x-axis, k (Vp/Vs) on the y-axis: transpose the (nH, nK) stack.
+        # Map the stack linearly onto 0..1 (min->0, max->1) so the colour axis is a
+        # true 0-1 range like paper Fig. 3, then paint invalid cells at 0 (dark).
+        s = d["stack"].T
+        mn, mx = np.nanmin(s), np.nanmax(s)
+        rng = mx - mn
+        s = (s - mn) / rng if (np.isfinite(rng) and rng > 0) else np.zeros_like(s)
+        s = np.nan_to_num(s, nan=0.0)
+        im = ax.pcolormesh(d["h_grid"], d["k_grid"], s, cmap="viridis",
+                           shading="auto", vmin=0, vmax=1)
+        # white crosshair at the maximum (paper Fig. 3 convention)
+        ax.axvline(float(d["bestH"]), color="w", lw=1.0)
+        ax.axhline(float(d["bestK"]), color="w", lw=1.0)
+        ax.set_xlabel("H (km)"); ax.set_ylabel("k (Vp/Vs)")
         ax.set_title(npz.stem.replace("_hk", ""))
-        fig.colorbar(im, ax=ax, label="stack")
+        fig.colorbar(im, ax=ax, label="amplitude")
     fig.tight_layout()
     _save(fig, "F4_hk_panels", cfg)
 
@@ -178,25 +196,70 @@ def F5_hk_summary(cfg):
     plt = _mpl()
     p = io_utils.paths(cfg)
     hk_dir = p.get("hk_out")
-    csvs = sorted(Path(hk_dir).glob("hk_*.csv")) if hk_dir else []
+    # Per-class H-kappa summaries are hk_<class>.csv. The glob also matches
+    # hk_corrected.csv (the kappa-correction table, different schema with no
+    # H_km/bounds columns) — exclude it, and defensively skip any csv missing
+    # the columns this figure plots, so one odd file never fails the whole figure.
+    need = {"station", "H_km", "H_lo", "H_hi", "kappa", "k_lo", "k_hi"}
+    csvs = [c for c in sorted(Path(hk_dir).glob("hk_*.csv"))
+            if c.name != "hk_corrected.csv"] if hk_dir else []
+    csvs = [c for c in csvs if need.issubset(pd.read_csv(c, nrows=0).columns)]
     if not csvs:
-        LOG.warning("F5: no hk_*.csv — skipping.")
+        LOG.warning("F5: no per-class hk_<class>.csv summaries — skipping.")
         return
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4))
+    # QC thresholds (config-overridable): a solution is flagged unreliable if its
+    # kappa sits on the search-grid edge (the maximum ran off the grid -> noise or
+    # wrong band) or its H 95%-contour half-width is too wide (poorly constrained).
+    hkp = cfg.get("plot", {}).get("hk_qc", {})
+    k_lo_edge, k_hi_edge = cfg.get("hk", {}).get("k_range", [1.6, 2.5])
+    k_edge_tol = float(hkp.get("kappa_edge_tol", 0.03))
+    h_err_max = float(hkp.get("h_halfwidth_max_km", 12.0))
+
+    def _bad(row):
+        rails = (row["kappa"] <= k_lo_edge + k_edge_tol
+                 or row["kappa"] >= k_hi_edge - k_edge_tol)
+        h_hw = max(row["H_km"] - row["H_lo"], row["H_hi"] - row["H_km"])
+        return rails or (np.isfinite(h_hw) and h_hw > h_err_max)
+
+    # H-k crossplot: k (Vp/Vs) on the x-axis, H (km) on the y-axis (depth down).
+    # One point per station/class, with x/y error bars from the 95%-contour bounds
+    # and station labels; QC-flagged solutions drawn faint with an x.
+    fig, ax = plt.subplots(figsize=(7.5, 6))
+    flagged = []
     for csv in csvs:
         cls = csv.stem.replace("hk_", "")
-        df = pd.read_csv(csv)
-        ax1.errorbar(df["station"], df["H_km"],
-                     yerr=[df["H_km"] - df["H_lo"], df["H_hi"] - df["H_km"]],
-                     fmt="o", capsize=3, label=cls)
-        ax2.errorbar(df["station"], df["kappa"],
-                     yerr=[df["kappa"] - df["k_lo"], df["k_hi"] - df["kappa"]],
-                     fmt="s", capsize=3, label=cls)
-    ax1.set_ylabel("H (km)"); ax2.set_ylabel("Vp/Vs")
-    for ax in (ax1, ax2):
-        ax.tick_params(axis="x", rotation=90); ax.legend()
+        df = pd.read_csv(csv).reset_index(drop=True)
+        bad = df.apply(_bad, axis=1).to_numpy()
+        flagged += [f"{s}/{cls}" for s in df["station"][bad]]
+        colour = None
+        for mask, alpha, marker in ((~bad, 1.0, "o"), (bad, 0.3, "x")):
+            if not mask.any():
+                continue
+            sub = df[mask]
+            eb = ax.errorbar(sub["kappa"], sub["H_km"],
+                             xerr=[sub["kappa"] - sub["k_lo"], sub["k_hi"] - sub["kappa"]],
+                             yerr=[sub["H_km"] - sub["H_lo"], sub["H_hi"] - sub["H_km"]],
+                             fmt=marker, ms=7, capsize=2, lw=0.8, alpha=alpha,
+                             color=(colour if colour else None),
+                             label=(cls if colour is None else None))
+            colour = colour or eb.lines[0].get_color()
+            for _, r in sub.iterrows():
+                ax.annotate(r["station"], (r["kappa"], r["H_km"]), fontsize=6,
+                            xytext=(3, 3), textcoords="offset points", alpha=alpha)
+    # shade the k grid-edge bands so railed (unreliable) solutions are obvious
+    ax.axvspan(k_hi_edge - k_edge_tol, k_hi_edge, color="0.88", zorder=0)
+    ax.axvspan(k_lo_edge, k_lo_edge + k_edge_tol, color="0.88", zorder=0)
+    ax.set_xlabel("k (Vp/Vs)"); ax.set_ylabel("H (km)")
+    ax.set_xlim(k_lo_edge, k_hi_edge)
+    ax.invert_yaxis()                         # depth increases downward
+    ax.legend(title="source class")
+    ax.set_title(f"H-k stacking summary  (grey = k grid edge; "
+                 f"faint x = QC-flagged, {len(flagged)})")
     fig.tight_layout()
     _save(fig, "F5_hk_summary", cfg)
+    if flagged:
+        LOG.info(f"F5 QC: {len(flagged)} unreliable H-kappa solutions "
+                 f"(kappa on grid edge or H poorly constrained): {flagged}")
 
 
 # --------------------------------------------------------------------------
@@ -270,18 +333,107 @@ def F7_ccp_sections(cfg):
     if not npzs:
         LOG.warning("F7: no CCP npz — skipping.")
         return
-    fig, axes = plt.subplots(len(npzs), 1, figsize=(9, 4 * len(npzs)), squeeze=False)
-    for ax, f in zip(axes[:, 0], npzs):
+    # Paper Fig. 6 style: the section is continuous because the CCP stack itself
+    # uses dense, overlapping along-profile bins (ccp.along_step / ccp.bin_km) and
+    # each RF is unit-peak normalized before stacking (ccp) — NOT image smoothing.
+    # The stored `amp` is already a mean normalized amplitude; here we only blank
+    # never-sampled bins and plot it on a fixed colour range.
+    clim = float(cfg.get("plot", {}).get("ccp_clim", 0.2))
+    # optional depth crop of the plotted section (km); None -> full depth_range.
+    ccp_dmax = cfg.get("plot", {}).get("ccp_max_depth", None)
+
+    # Profile geometry (endpoints) keyed by name, so the map can draw each line and
+    # mark its 0-km end (= endpoint 1 = lon1/lat1, where the section's x-axis starts).
+    geom = {pr["name"]: pr for pr in cfg.get("ccp", {}).get("profiles", [])}
+    try:
+        stations, _ = io_utils.load_stations(cfg)
+    except Exception as e:
+        LOG.debug(f"F7 map: stations unavailable ({e}).")
+        stations = []
+
+    from matplotlib.gridspec import GridSpec
+    from matplotlib.patches import Rectangle
+    n = len(npzs)
+    fig = plt.figure(figsize=(17, 3.8 * n))
+    # LEFT column: a network-context map (top) + a zoomed profile map (bottom).
+    # RIGHT column: the section panels stacked. Split the left column in two.
+    gs = GridSpec(n, 2, width_ratios=[1.0, 2.3], figure=fig,
+                  wspace=0.22, hspace=0.45)
+    half = max(1, n // 2)
+    mlat = np.mean([s.latitude for s in stations]) if stations else \
+        np.mean([pr["lat1"] for pr in geom.values()] or [0.0])
+    aspect = 1.0 / max(np.cos(np.deg2rad(mlat)), 1e-3)      # ~true-scale lon/lat
+    cyc = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+
+    # zoom window = profile bounding box + padding
+    plons = [pr[k] for pr in geom.values() for k in ("lon1", "lon2")] or [0.0]
+    plats = [pr[k] for pr in geom.values() for k in ("lat1", "lat2")] or [0.0]
+    padx = max((max(plons) - min(plons)) * 0.35, 0.03)
+    pady = max((max(plats) - min(plats)) * 0.35, 0.03)
+    zx = (min(plons) - padx, max(plons) + padx)
+    zy = (min(plats) - pady, max(plats) + pady)
+
+    def _draw_profiles(ax, labels):
+        if stations:
+            ax.scatter([s.longitude for s in stations], [s.latitude for s in stations],
+                       marker="^", s=26, c="0.35", zorder=2, label="stations")
+        for i, (nm, pr) in enumerate(geom.items()):
+            c = cyc[i % len(cyc)]
+            ax.plot([pr["lon1"], pr["lon2"]], [pr["lat1"], pr["lat2"]], "-", lw=2.2,
+                    color=c, zorder=3)
+            ax.plot(pr["lon1"], pr["lat1"], "o", color=c, ms=8, zorder=4)       # 0 km
+            ax.plot(pr["lon2"], pr["lat2"], "o", mfc="white", mec=c, mew=1.6,   # far end
+                    ms=8, zorder=4)
+            if not labels:
+                continue
+            # offset each label OUTWARD from the line centre so the two 0-km ends
+            # (which nearly coincide) don't collide.
+            mlon = 0.5 * (pr["lon1"] + pr["lon2"]); mla = 0.5 * (pr["lat1"] + pr["lat2"])
+            for lon, lat, txt in ((pr["lon1"], pr["lat1"], f"{nm} 0 km"),
+                                  (pr["lon2"], pr["lat2"], f"{nm}'")):
+                ox = 9 * (1 if lon >= mlon else -1)
+                oy = 9 * (1 if lat >= mla else -1)
+                ax.annotate(txt, (lon, lat), color=c, fontsize=9, fontweight="bold",
+                            xytext=(ox, oy), textcoords="offset points",
+                            ha="left" if ox >= 0 else "right",
+                            va="bottom" if oy >= 0 else "top", zorder=5)
+
+    # context map (full network) with the zoom window drawn on it
+    axc = fig.add_subplot(gs[:half, 0])
+    _draw_profiles(axc, labels=False)
+    axc.add_patch(Rectangle((zx[0], zy[0]), zx[1] - zx[0], zy[1] - zy[0],
+                            fill=False, ec="k", lw=1.2, ls="--", zorder=6))
+    axc.set_aspect(aspect)
+    axc.set_xlabel("Longitude (deg E)"); axc.set_ylabel("Latitude (deg N)")
+    axc.set_title("Network context (dashed box = zoom)")
+    axc.grid(True, ls=":", alpha=0.4)
+    axc.legend(loc="best", fontsize=8)
+
+    # zoomed map (profiles + labels)
+    axz = fig.add_subplot(gs[half:, 0])
+    _draw_profiles(axz, labels=True)
+    axz.set_xlim(*zx); axz.set_ylim(*zy)
+    axz.set_aspect(aspect)
+    axz.set_xlabel("Longitude (deg E)"); axz.set_ylabel("Latitude (deg N)")
+    axz.set_title("CCP profiles (filled dot = 0 km end)")
+    axz.grid(True, ls=":", alpha=0.4)
+
+    for j, f in enumerate(npzs):
+        ax = fig.add_subplot(gs[j, 1])
         d = np.load(f)
-        vmax = np.nanpercentile(np.abs(d["amp"]), 98)
-        if not np.isfinite(vmax) or vmax <= 0:  # `or` would keep NaN (truthy)
-            vmax = 1.0
-        im = ax.pcolormesh(d["along"], d["depth"], d["amp"].T, cmap="RdBu_r",
-                           vmin=-vmax, vmax=vmax, shading="auto")
-        ax.invert_yaxis(); ax.set_ylabel("Depth (km)")
-        ax.set_xlabel("Distance (km)"); ax.set_title(f"CCP {f.stem}")
-        fig.colorbar(im, ax=ax, label="RF amp")
-    fig.tight_layout()
+        amp = d["amp"].astype(float)               # (along, depth), mean norm amp
+        if "count" in d.files:                     # blank bins that never sampled
+            amp = np.where(d["count"] > 0, amp, np.nan)
+        amp = np.ma.masked_invalid(amp)
+        im = ax.pcolormesh(d["along"], d["depth"], amp.T, cmap="RdBu_r",
+                           vmin=-clim, vmax=clim, shading="nearest")
+        # depth axis increases downward; crop to ccp_max_depth if set.
+        dbot = float(ccp_dmax) if ccp_dmax else float(np.max(d["depth"]))
+        ax.set_ylim(dbot, 0); ax.set_ylabel("Depth (km)")
+        ax.set_xlabel("Distance along profile (km)"); ax.set_title(f"CCP {f.stem}")
+        fig.colorbar(im, ax=ax, label="Mean normalized amplitude")
+    # the spanning map axes aren't tight_layout-compatible; spacing is already set
+    # via the GridSpec wspace/hspace, so skip tight_layout (and its warning) here.
     _save(fig, "F7_ccp_sections", cfg)
 
 
@@ -290,28 +442,164 @@ def F7_ccp_sections(cfg):
 # --------------------------------------------------------------------------
 
 def F8_ccf_gather(cfg):
+    """Noise CCF gather vs interstation distance.
+
+    The raw CCFs span the full ±(cc_len/2) correlation lag (±1800 s here), but the
+    surface-wave signal only occupies |t| < dist/v_min. Plotting the full lag drowns
+    the signal in ~2 % of the panel, so we crop to a physically-motivated window,
+    optionally fold to the symmetric (causal+acausal) component to gain SNR, and
+    stack into distance bins so 300 overlapping pairs become a legible moveout.
+    Dashed reference lines mark constant apparent velocities.
+    """
     plt = _mpl()
-    from scipy.signal import butter, filtfilt
+    from scipy.signal import butter, filtfilt, hilbert
+    pl = cfg.get("plot", {})
     p = io_utils.paths(cfg)
     files = sorted(Path(p["ccfs"]).glob("*.npz")) if Path(p["ccfs"]).exists() else []
     if not files:
         LOG.warning("F8: no CCFs — skipping.")
         return
-    band = cfg.get("plot", {}).get("ccf_bandpass", [0.2, 0.4])
-    fig, ax = plt.subplots(figsize=(7, 8))
+    band = pl.get("ccf_bandpass", [0.2, 0.4])
+    symmetric = pl.get("ccf_symmetric", True)     # fold causal+acausal (SNR)
+    bin_km = pl.get("ccf_dist_bin_km", 0.5)        # distance-bin stacking; 0 = per pair (MSNoise style)
+    ref_vels = pl.get("ccf_ref_vels", [1.5, 2.5, 3.5])  # km/s moveout guides
+    v_min = pl.get("ccf_v_min", 1.0)               # sets the auto lag window
+    fill = pl.get("ccf_fill", True)                # fill positive lobes (variable-area; False = wiggle only)
+    fill_color = pl.get("ccf_fill_color", "k")     # variable-area fill colour (black is the seismic standard)
+    ampli = pl.get("ccf_ampli")                    # km per unit amplitude; None = auto (row spacing)
+    gain = pl.get("ccf_gain", 1.0)                 # multiplies the wiggle amplitude (make moveout pop)
+    clip = pl.get("ccf_clip", 1.0)                 # clip normalized amplitude to +/-clip before scaling
+    min_pairs = pl.get("ccf_min_pairs", 1)         # drop distance bins with fewer pairs (undersampled)
+    annotate_n = pl.get("ccf_annotate_n", False)   # label each row with its pair count
+    zero_lag_mute = pl.get("ccf_zero_lag_mute", 0.0)  # s; Gaussian taper of the stationary
+                                                    # zero-lag lobe that otherwise masks the moveout
+    pws = pl.get("ccf_pws", 0.0)                    # phase-weighted-stack power (nu); 0 = linear stack.
+                                                    # nu~1 suppresses incoherent scatter within each bin
+    row_norm = pl.get("ccf_row_norm", True)         # renormalize each bin to unit amplitude before
+                                                    # drawing (equalizes rows; needed so PWS bins stay visible)
+
+    # ---- load, filter, normalize each pair on its own signal window -------------
+    traces = []                                     # (dist_km, lag[>=0], amp)
+    dmax = 0.0
     for f in files:
         d = np.load(f)
         dist = float(d["dist_km"]) if "dist_km" in d else np.nan
-        if not np.isfinite(dist):
+        if not np.isfinite(dist) or dist <= 0:
             continue
-        lag, ccf = d["lag_s"], d["ccf"].astype(float)
+        lag, ccf = d["lag_s"].astype(float), d["ccf"].astype(float)
         sr = 1.0 / (lag[1] - lag[0])
         b, a = butter(3, [band[0] / (sr / 2), band[1] / (sr / 2)], btype="band")
         y = filtfilt(b, a, ccf)
-        y = y / (np.max(np.abs(y)) or 1) * 3.0
-        ax.plot(lag, dist + y, "k", lw=0.4)
-    ax.set_xlabel("Lag (s)"); ax.set_ylabel("Interstation distance (km)")
-    ax.set_title(f"CCF gather {band[0]}-{band[1]} Hz")
+        dt = 1.0 / sr
+        # resample onto a common positive-lag grid via causal/acausal interpolation
+        tmax_data = float(np.abs(lag).max())
+        tpos = np.arange(0.0, tmax_data, dt)
+        causal = np.interp(tpos, lag, y)
+        acausal = np.interp(tpos, -lag[::-1], y[::-1])
+        if zero_lag_mute > 0:
+            # taper -> 0 at lag 0, -> 1 by ~2*mute; kills the stationary lobe near t=0
+            taper = 1.0 - np.exp(-(tpos / zero_lag_mute) ** 2)
+            causal = causal * taper
+            acausal = acausal * taper
+        amp = (causal + acausal) / 2.0 if symmetric else causal
+        # (for the two-sided view we keep both branches below)
+        traces.append((dist, tpos, causal, acausal, amp))
+        dmax = max(dmax, dist)
+
+    if not traces:
+        LOG.warning("F8: no finite-distance CCFs — skipping.")
+        return
+
+    lag_max = pl.get("ccf_lag_max") or (dmax / v_min + 5.0)   # s, cropped window
+
+    # ---- distance binning + linear stack of per-pair-normalized traces ----------
+    tpos = traces[0][1]
+    win = tpos <= lag_max
+    tpos = tpos[win]
+
+    def _norm(sig):
+        m = np.max(np.abs(sig[win])) or 1.0
+        return sig[win] / m
+
+    def _stack(members):
+        # linear mean, optionally phase-weighted (Schimmel & Paulssen 1997): the linear
+        # stack is multiplied by the inter-trace instantaneous-phase coherence^pws, which
+        # suppresses scattered energy that is incoherent across the pairs in this bin.
+        A = np.asarray(members)
+        lin = A.mean(axis=0)
+        if pws and pws > 0 and A.shape[0] >= 2:
+            phase = np.angle(hilbert(A, axis=1))
+            coh = np.abs(np.mean(np.exp(1j * phase), axis=0))
+            return lin * coh ** pws
+        return lin
+
+    if bin_km and bin_km > 0:
+        acc = {}                                     # bin -> [amp[], cau[], aca[]]
+        for dist, _t, cau, aca, amp in traces:
+            k = int(round(dist / bin_km))
+            s = acc.setdefault(k, [[], [], []])
+            s[0].append(_norm(amp))
+            s[1].append(_norm(cau))
+            s[2].append(_norm(aca))
+        rows = [(k * bin_km, len(s[0]), _stack(s[0]), _stack(s[1]), _stack(s[2]))
+                for k, s in sorted(acc.items()) if len(s[0]) >= min_pairs]
+        spacing = bin_km
+    else:
+        rows = [(dist, 1, _norm(amp), _norm(cau), _norm(aca))
+                for dist, _t, cau, aca, amp in sorted(traces)]
+        spacing = np.median(np.diff(sorted(t[0] for t in traces))) or 0.2
+
+    if not rows:
+        LOG.warning("F8: all distance bins culled by ccf_min_pairs — skipping.")
+        return
+    dmax_show = max(r[0] for r in rows)          # top of the *populated* range (after culling)
+    scale = (float(ampli) if ampli else spacing) * gain   # wiggle amplitude in km units
+    lw = 0.4 if len(rows) < 60 else 0.3
+
+    # ---- draw -------------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(7, 9))
+    for dist, n, sym, cau, aca in rows:
+        if symmetric:
+            branches = [(tpos, sym)]
+            rn = np.max(np.abs(sym)) if row_norm else 1.0
+        else:
+            branches = [(tpos, cau), (-tpos, aca)]   # causal right, acausal left
+            # one factor for both branches keeps their relative amplitude (= noise-source asymmetry)
+            rn = max(np.max(np.abs(cau)), np.max(np.abs(aca))) if row_norm else 1.0
+        rn = rn or 1.0
+        for x, s in branches:
+            s = np.clip(s / rn, -clip, clip)
+            w = dist + s * scale
+            ax.plot(x, w, "k", lw=lw, zorder=3)
+            if fill:
+                ax.fill_between(x, dist, w, where=(s > 0), color=fill_color,
+                                lw=0, zorder=2)
+        if annotate_n and (bin_km and bin_km > 0):
+            ax.annotate(str(int(n)), xy=(lag_max, dist), xytext=(2, 0),
+                        textcoords="offset points", fontsize=5.5, color="0.5",
+                        va="center", clip_on=False)
+
+    for v in ref_vels:
+        tv = np.array([0.0, lag_max])
+        ax.plot(tv, tv * v, "--", color="0.35", lw=0.8, zorder=4)
+        if not symmetric:
+            ax.plot(-tv, tv * v, "--", color="0.35", lw=0.8, zorder=4)
+        # label each guide where it exits the panel (top edge, else right edge)
+        if dmax_show / v <= lag_max:
+            lx, ly, va, ha = dmax_show / v, dmax_show, "bottom", "center"
+        else:
+            lx, ly, va, ha = lag_max, lag_max * v, "center", "right"
+        ax.annotate(f"{v:g} km/s", xy=(lx, ly), xytext=(3, 3),
+                    textcoords="offset points", ha=ha, va=va,
+                    fontsize=7, color="0.35")
+
+    ax.set_xlim(0 if symmetric else -lag_max, lag_max)
+    ax.set_ylim(-spacing, dmax_show + spacing)
+    ax.set_xlabel("Lag (s)")
+    ax.set_ylabel("Interstation distance (km)")
+    tag = "symmetric" if symmetric else "two-sided"
+    grouping = f"{len(rows)} bins" if (bin_km and bin_km > 0) else f"{len(rows)} pairs"
+    ax.set_title(f"CCF gather {band[0]}–{band[1]} Hz  ({tag}, {grouping})")
     fig.tight_layout()
     _save(fig, "F8_ccf_gather", cfg)
 
