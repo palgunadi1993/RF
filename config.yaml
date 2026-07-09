@@ -298,8 +298,25 @@ plot:
     F11_vs_cross_sections: true
     F12_structural_model: true
     F13_dispersion_pair_curves: true    # Stage 6: all station-pair phase-vel curves
+    F13b_dispersion_image: true         # Stage 6: phase-vel dispersion energy image (colormap)
+    F13c_ftan_panels: true              # Stage 6: per-pair FTAN group-vel spectrograms (supplementary)
     F14_dispersion_station_curves: true # Stage 7: two-station-average per-station curves
   # ---- figure-specific params ----
+  # F13b phase-velocity dispersion image (slant-stack of cross-spectra)
+  disp_img_fmin: 0.15                      # Hz, low edge (period 6.7 s)
+  disp_img_fmax: 1.2                       # Hz, high edge (period 0.83 s)
+  disp_img_vmin: 0.8                       # km/s, phase-velocity axis min
+  disp_img_vmax: 3.0                       # km/s, phase-velocity axis max (caps slant-stack alias lobe)
+  disp_img_dmin: 2.0                       # km, drop very short pairs (< a few wavelengths)
+  disp_img_cmap: turbo                     # energy colormap
+  # F13c per-pair FTAN group-velocity spectrograms (supplementary)
+  ftan_n_pairs: 4                          # number of highest-SNR example pairs to show
+  ftan_dist_range: [5.0, 16.0]             # km, pick example pairs from this interstation band
+  ftan_vmin: 0.8                           # km/s, group-velocity axis min
+  ftan_vmax: 2.6                           # km/s, group-velocity axis max
+  ftan_period_min: 0.8                     # s
+  ftan_period_max: 6.0                     # s
+  ftan_zero_lag_mute: 1.5                  # s, Gaussian taper of the zero-lag lobe before FTAN
   cross_sections: [NS, EW]
   vs_slice_depths_km: [2, 5, 10, 20]       # F9 Vs depth slices (tomo.path == A)
   representative_stations: [ST01, ST05]    # F4 / F10 example panels (DG codes)

@@ -659,6 +659,197 @@ def F13_dispersion_pair_curves(cfg):
 
 
 # --------------------------------------------------------------------------
+# F13b — array phase-velocity dispersion IMAGE (slant-stack of cross-spectra)
+# --------------------------------------------------------------------------
+
+def F13b_dispersion_image(cfg):
+    """Network phase-velocity dispersion image: energy colormap vs period & velocity.
+
+    The complement to F13's picked curves — this shows the *energy the picks come
+    from*. Every pair's complex cross-spectrum is phase-shifted by exp(i 2π f d/c)
+    and stacked over all pairs (Park/Aki slant-stack); the fundamental-mode Rayleigh
+    wave lights up as a coherent ridge. The F13 median pick is overlaid for QC.
+    """
+    plt = _mpl()
+    pl = cfg.get("plot", {})
+    p = io_utils.paths(cfg)
+    files = sorted(Path(p["ccfs"]).glob("*.npz")) if Path(p["ccfs"]).exists() else []
+    if not files:
+        LOG.warning("F13b: no CCFs — skipping.")
+        return
+    fmin = pl.get("disp_img_fmin", 0.15)
+    fmax = pl.get("disp_img_fmax", 1.2)
+    vmin = pl.get("disp_img_vmin", 0.8)
+    vmax = pl.get("disp_img_vmax", 3.0)
+    dmin = pl.get("disp_img_dmin", 2.0)            # need a few wavelengths for a stable phase term
+    cmap = pl.get("disp_img_cmap", "turbo")
+
+    spectra, freq = [], None
+    for f in files:
+        d = np.load(f)
+        dist = float(d["dist_km"]) if "dist_km" in d else np.nan
+        if "corr_spectrum" not in d or not np.isfinite(dist) or dist < dmin:
+            continue
+        if freq is None:
+            freq = d["freq"].astype(float)
+        spectra.append((dist, d["corr_spectrum"]))
+    if len(spectra) < 5:
+        LOG.warning("F13b: too few usable cross-spectra — skipping.")
+        return
+
+    sel = (freq >= fmin) & (freq <= fmax)
+    fsel = freq[sel]
+    cgrid = np.linspace(vmin, vmax, 351)
+    # E(f,c) = | Σ_pairs phase(f) · exp(i 2π f d/c) |   (phase-only = spectral whitening)
+    E = np.zeros((len(cgrid), sel.sum()))
+    for dist, spec in spectra:
+        ph = spec[sel] / (np.abs(spec[sel]) + 1e-12)
+        phase = 2 * np.pi * fsel * dist
+        for ic, c in enumerate(cgrid):
+            E[ic] += np.real(ph * np.exp(1j * phase / c))
+    E = np.abs(E)
+    E /= (E.max(axis=0, keepdims=True) + 1e-12)     # per-period normalization
+    try:
+        from scipy.ndimage import gaussian_filter
+        E = gaussian_filter(E, 0.8)
+    except Exception:
+        pass
+
+    per = 1.0 / fsel
+    fig, ax = plt.subplots(figsize=(8, 6))
+    im = ax.pcolormesh(per, cgrid, E, cmap=cmap, shading="auto", vmin=0, vmax=1,
+                       rasterized=True)   # keep the SVG small (embed a bitmap, not millions of cells)
+    # overlay the F13 median picked curve for cross-validation
+    disp_dir = p.get("disp")
+    if disp_dir and Path(disp_dir).exists():
+        from collections import defaultdict
+        by_T = defaultdict(list)
+        for df in sorted(Path(disp_dir).glob("*.disp")):
+            arr = _load_disp(df)
+            if arr is None:
+                continue
+            for Ti, ci in zip(arr[:, 0], arr[:, 1]):
+                if np.isfinite(ci):
+                    by_T[round(float(Ti), 3)].append(ci)
+        if by_T:
+            Ts = sorted(by_T)
+            med = [np.median(by_T[T]) for T in Ts]
+            ax.plot(Ts, med, "k-o", lw=2, ms=4, label="F13 median pick")
+            ax.legend(loc="upper left", fontsize=8)
+    ax.set_xlim(1.0 / fmax, 1.0 / fmin)
+    ax.set_ylim(vmin, vmax)
+    ax.set_xlabel("Period (s)"); ax.set_ylabel("Phase velocity (km/s)")
+    ax.set_title(f"Rayleigh phase-velocity dispersion image ({len(spectra)} pairs, slant-stack)")
+    fig.colorbar(im, ax=ax, label="normalized energy")
+    fig.tight_layout()
+    _save(fig, "F13b_dispersion_image", cfg)
+
+
+# --------------------------------------------------------------------------
+# F13c — per-pair FTAN group-velocity spectrograms (supplementary)
+# --------------------------------------------------------------------------
+
+def F13c_ftan_panels(cfg):
+    """Per-pair FTAN (frequency-time analysis) group-velocity spectrograms.
+
+    Supplementary QC: narrow Gaussian filters sweep frequency; the analytic-signal
+    envelope maps the surface-wave packet into a group-velocity (dist/lag) vs period
+    energy image. The highest-SNR pairs in a mid-distance band are shown; the white
+    trace follows the energy ridge (fundamental-mode group-velocity dispersion).
+    """
+    plt = _mpl()
+    from scipy.signal import hilbert, butter, filtfilt
+    pl = cfg.get("plot", {})
+    p = io_utils.paths(cfg)
+    files = sorted(Path(p["ccfs"]).glob("*.npz")) if Path(p["ccfs"]).exists() else []
+    if not files:
+        LOG.warning("F13c: no CCFs — skipping.")
+        return
+    npair = int(pl.get("ftan_n_pairs", 4))
+    drange = pl.get("ftan_dist_range", [5.0, 16.0])
+    umin = pl.get("ftan_vmin", 0.8)
+    umax = pl.get("ftan_vmax", 2.6)
+    pmin = pl.get("ftan_period_min", 0.8)
+    pmax = pl.get("ftan_period_max", 6.0)
+    mute = pl.get("ftan_zero_lag_mute", 1.5)
+
+    def _sym(d):
+        lag = d["lag_s"].astype(float); ccf = d["ccf"].astype(float)
+        sr = 1.0 / (lag[1] - lag[0]); dt = 1.0 / sr
+        tpos = np.arange(0.0, lag.max(), dt)
+        cau = np.interp(tpos, lag, ccf); aca = np.interp(tpos, -lag[::-1], ccf[::-1])
+        e = (cau + aca) / 2.0
+        if mute > 0:
+            e = e * (1.0 - np.exp(-(tpos / mute) ** 2))
+        return tpos, e, sr
+
+    def _snr(d, tpos, e, sr):
+        dist = float(d["dist_km"])
+        b, a = butter(3, [0.2 / (sr / 2), 0.8 / (sr / 2)], btype="band")
+        y = filtfilt(b, a, e)
+        sig = (tpos >= dist / 3.0) & (tpos <= dist / 0.8)
+        noi = (tpos >= dist / 0.8 + 10) & (tpos <= dist / 0.8 + 60)
+        if sig.sum() < 3 or noi.sum() < 3:
+            return 0.0
+        return float(np.max(np.abs(y[sig])) / (np.std(y[noi]) + 1e-9))
+
+    scored = []
+    for f in files:
+        d = np.load(f)
+        dist = float(d["dist_km"]) if "dist_km" in d else np.nan
+        if not np.isfinite(dist) or not (drange[0] <= dist <= drange[1]):
+            continue
+        tpos, e, sr = _sym(d)
+        scored.append((_snr(d, tpos, e, sr), dist, f))
+    if not scored:
+        LOG.warning("F13c: no pairs in the FTAN distance band — skipping.")
+        return
+    scored.sort(reverse=True)
+    picks = scored[:npair]
+
+    per = np.linspace(pmin, pmax, 140)
+    U = np.linspace(umin, umax, 220)
+
+    def _ftan(tpos, egf, sr, dist):
+        fc = 1.0 / per
+        N = len(egf); freqs = np.fft.rfftfreq(N, 1.0 / sr); F = np.fft.rfft(egf)
+        img = np.zeros((len(U), len(fc)))
+        for j, f0 in enumerate(fc):
+            G = np.exp(-8.0 * ((freqs - f0) / f0) ** 2)
+            env = np.abs(hilbert(np.fft.irfft(F * G, N)))
+            img[:, j] = np.interp(dist / U, tpos, env, left=0, right=0)
+        return img / (img.max(axis=0, keepdims=True) + 1e-12)
+
+    try:
+        from scipy.ndimage import gaussian_filter
+    except Exception:
+        gaussian_filter = None
+    ncol = 2 if len(picks) > 1 else 1
+    nrow = int(np.ceil(len(picks) / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(6 * ncol, 4 * nrow), squeeze=False,
+                             constrained_layout=True)
+    im = None
+    for ax, (s, dist, f) in zip(axes.ravel(), picks):
+        d = np.load(f); tpos, egf, sr = _sym(d)
+        img = _ftan(tpos, egf, sr, dist)
+        if gaussian_filter is not None:
+            img = gaussian_filter(img, 0.7)
+        im = ax.pcolormesh(per, U, img, cmap="turbo", shading="auto", vmin=0.15, vmax=1,
+                           rasterized=True)
+        ridge = np.array([U[np.argmax(img[:, j])] for j in range(img.shape[1])])
+        ax.plot(per, ridge, "w.", ms=2)
+        name = "–".join(Path(f).stem.split("_")[:2])
+        ax.set_title(f"{name}   {dist:.1f} km   SNR {s:.0f}", fontsize=9)
+        ax.set_xlabel("Period (s)"); ax.set_ylabel("Group velocity (km/s)")
+    for ax in axes.ravel()[len(picks):]:
+        ax.axis("off")
+    if im is not None:
+        fig.colorbar(im, ax=axes, shrink=0.6, label="normalized energy")
+    fig.suptitle("Per-pair FTAN group-velocity spectrograms (highest-SNR pairs)")
+    _save(fig, "F13c_ftan_panels", cfg)
+
+
+# --------------------------------------------------------------------------
 # F14 — per-station dispersion curves (Stage 7 output: tomo/*_disp.txt)
 # --------------------------------------------------------------------------
 
@@ -843,6 +1034,8 @@ _FIGURES = {
     "F11_vs_cross_sections": F11_vs_cross_sections,
     "F12_structural_model": F12_structural_model,
     "F13_dispersion_pair_curves": F13_dispersion_pair_curves,
+    "F13b_dispersion_image": F13b_dispersion_image,
+    "F13c_ftan_panels": F13c_ftan_panels,
     "F14_dispersion_station_curves": F14_dispersion_station_curves,
 }
 
@@ -857,7 +1050,8 @@ STAGE_FIGURES: dict[str, list[str]] = {
     "hk":         ["F4_hk_panels", "F5_hk_summary"],
     "ccp":        ["F7_ccp_sections"],
     "ant":        ["F3_coverage_raypaths", "F8_ccf_gather"],
-    "dispersion": ["F13_dispersion_pair_curves"],
+    "dispersion": ["F13_dispersion_pair_curves", "F13b_dispersion_image",
+                   "F13c_ftan_panels"],
     "tomo":       ["F14_dispersion_station_curves"],
     "dsurftomo":  ["F9_dispersion_maps"],
     "inversion":  ["F10_inversion_per_station", "F11_vs_cross_sections",
