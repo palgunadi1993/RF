@@ -182,8 +182,15 @@ def run(cfg: dict) -> Path:
     nz = len(depth_nodes)
     spacing = float(d.get("grid_spacing_deg", 0.02))
     pad = float(d.get("pad_deg", spacing))
-    nx, ny, goxd, gozd, dvxd, dvzd = _grid_from_stations(stations, spacing, pad)
-    nsrc = len(stations)
+    # Grid MUST span only the stations that actually carry dispersion data. The full
+    # inventory can include far-flung stations with no CCFs (here 43 stations over
+    # 170 km vs 25 Dieng-array stations over 23 km); sizing the grid to all of them
+    # yields a mostly-empty model whose unconstrained cells feed NaNs into the depth
+    # kernel and crash DSurfTomo's LSMR solver. Fall back to all stations only if the
+    # data-station lookup somehow came back empty.
+    grid_stations = [s for s in stations if s.code in used] or stations
+    nx, ny, goxd, gozd, dvxd, dvzd = _grid_from_stations(grid_stations, spacing, pad)
+    nsrc = len(grid_stations)
 
     datafile = "surfdataTB.dat"
     nrec = _write_surfdata(out_dir / datafile, groups, periods, sta_lookup, 2, veltype)

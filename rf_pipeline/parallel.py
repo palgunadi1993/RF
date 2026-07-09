@@ -114,13 +114,19 @@ def executor(n_jobs: int) -> ProcessPoolExecutor:
                                mp_context=mp.get_context("spawn"))
 
 
-def pmap(fn, tasks: list[tuple], n_jobs: int, desc: str = "") -> list:
+def pmap(fn, tasks: list[tuple], n_jobs: int, desc: str = "",
+         backend: str = "process") -> list:
     """Run ``fn(*task)`` for every task; results in task order.
 
     Serial (in-process) when ``n_jobs == 1`` or there is only one task, so the
     single-core path is exactly the old sequential behaviour. A task that
     raises is logged and yields None instead of killing the stage — callers
     already treat missing per-unit results as "skipped".
+
+    ``backend='thread'`` uses a ThreadPoolExecutor instead of the spawn process
+    pool. Required when ``fn`` itself spawns processes (e.g. BayHunter's
+    mp_inversion): nesting that inside the spawn pool fails to pickle its local
+    worker fn. Threads just launch-and-wait while the inner processes do the work.
     """
     label = desc or getattr(fn, "__name__", "task")
     total = len(tasks)
@@ -135,12 +141,18 @@ def pmap(fn, tasks: list[tuple], n_jobs: int, desc: str = "") -> list:
             _log_tick(label, i, total)
         return out
 
-    LOG.info(f"{label}: {total} tasks on {n_jobs} processes")
+    if backend == "thread":
+        from concurrent.futures import ThreadPoolExecutor
+        pool = ThreadPoolExecutor(max_workers=n_jobs)
+        LOG.info(f"{label}: {total} tasks on {n_jobs} threads")
+    else:
+        pool = executor(n_jobs)
+        LOG.info(f"{label}: {total} tasks on {n_jobs} processes")
     # Preserve task order in the result while still reporting completions as they
     # arrive: submit in order (remember each future's index), fill results by that
     # index, and tick the counter every time *any* worker finishes.
     out: list = [None] * total
-    with executor(n_jobs) as ex:
+    with pool as ex:
         fut_index = {ex.submit(fn, *t): i for i, t in enumerate(tasks)}
         done = 0
         for fut in as_completed(fut_index):

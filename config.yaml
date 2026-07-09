@@ -28,7 +28,8 @@ project:
   # Used by Stage 2 (per station), Stage 5 (per day), Stage 6 (per pair); Stage 8
   # runs n_jobs // inversion.mcmc.chains stations at once (BayHunter already
   # parallelizes its chains). Set 1 to force the old fully-serial behaviour.
-  n_jobs: 4
+  n_jobs: 18                    # 22-core box: Stage 8 runs 18//6 = 3 stations x 6 chains
+                                # at once (leaves ~4 cores free); mem cap below still applies
   # Memory-aware cap on the worker count (safety net for n_jobs: -1). Workers are
   # reduced so `workers * mem_per_worker_gb` fits in currently-free RAM minus
   # `mem_headroom_gb`, using the kernel's MemAvailable at launch. This is what keeps
@@ -201,14 +202,21 @@ ant:
 # ref_curve. Picks are resampled onto `periods` for the joint inversion.
 # -----------------------------------------------------------------------------
 dispersion:
-  periods: [0.5, 0.75, 1, 1.5, 2, 3, 4, 5, 6, 8]   # s (node-realistic band)
-  min_vel: 1.5                  # km/s, picking bounds (get_smooth_pv)
+  # Reachable band only: with a 23 km aperture + min_wavelengths, periods >3-4 s have
+  # ~0 eligible pairs (5 s: 2%, 6 s: 1 pair, 8 s: none), so they were empty phantoms.
+  # Reachable band only: with a 23 km aperture + min_wavelengths, periods >3-4 s have
+  # ~0 eligible pairs (5 s: 2%, 6 s: 1 pair, 8 s: none), so they were empty phantoms.
+  # 0.5 & 3 s are listed but yield no picks (scattering / coverage) -> 4 effective
+  # points at 0.75, 1, 1.5, 2 s.
+  periods: [0.5, 0.75, 1, 1.5, 2, 3]   # s (physically measurable band for this array)
+  min_vel: 1.0                  # km/s, picking bounds — was 1.5, clipped real ~1-1.5 km/s energy
   max_vel: 5.0
-  velband: [5.0, 4.5, 1.5, 1.1] # velocity_filter corners (out,in,in,out) km/s
-  min_wavelengths: 2            # reject paths shorter than N wavelengths
-  # ref_curve: Rayleigh phase-velocity guide [[period_s, c_kms], ...]. Defaults to
-  # a generic Dieng-crust curve in dispersion.py; override here if you have one.
-  # ref_curve: [[8,3.2],[5,2.9],[3,2.5],[2,2.2],[1,1.8],[0.5,1.5]]
+  velband: [5.0, 4.5, 1.1, 0.9] # velocity_filter corners (out,in,in,out) km/s — low corners
+                                # lowered to pass the ~1 km/s energy the FTAN shows
+  min_wavelengths: 1.5          # was 2; relaxed to recover mid-period picks on this small array
+  # Reference Rayleigh phase-velocity guide matched to the MEASURED trend (F13b/F13),
+  # so the 2*pi branch resolves against reality instead of a generic crust curve.
+  ref_curve: [[3, 2.2], [2, 2.05], [1.5, 1.9], [1, 1.75], [0.75, 1.65], [0.5, 1.55]]
 
 # -----------------------------------------------------------------------------
 # STAGE 7 — dispersion -> per-station curve
@@ -226,20 +234,30 @@ tomo:
 # compiled Fortran binary. All input formats verified against DSurfTomo source.
 # -----------------------------------------------------------------------------
 dsurftomo:
-  enabled: false                # true to write inputs (+ run if binary set)
-  binary: null                  # path to compiled DSurfTomo; null -> write inputs only
+  enabled: true                # true to write inputs (+ run if binary set)
+  binary: /home/kadek/Documents/software/DSurfTomo/bin/DSurfTomo                  # path to compiled DSurfTomo; null -> write inputs only
   measure: phase                # phase | group (Rayleigh)
   grid_spacing_deg: 0.02        # dvxd = dvzd (lat/lon node spacing)
-  pad_deg: 0.02                 # extend grid this far beyond the array
-  depth_nodes_km: [0, 0.5, 1, 2, 3, 5, 8, 12, 20]   # nz nodes (defines nz)
-  init_minvel: 0.8              # surface Vs of the linear-gradient starting model
-  init_velgrad: 0.15            # Vs increase per km depth (km/s / km)
+  pad_deg: 0.06                 # extend grid beyond the array; must be >=2 grid nodes so
+                                # edge stations sit strictly inside (DSurfTomo excludes the
+                                # outer node ring from ray tracing -> "Receiver outside model")
+  # Depth grid must match the data's sensitivity: 0.75-2 s Rayleigh senses only the
+  # top ~2-3 km, so nodes to 20 km were unconstrained (they starved the kernel -> NaN).
+  # Bottom node (5 km) is the half-space margin below the ~2-3 km sensitivity.
+  depth_nodes_km: [0, 0.3, 0.6, 1.0, 1.5, 2.0, 3.0, 5.0, 8.0, 12.0, 20.0]   # nz nodes (defines nz)
+  # Starting model MUST be able to reproduce the observed phase velocities: Rayleigh
+  # c ~= 0.92*Vs, and c cannot exceed the model's Vs. Observed c = 1.45-2.45 km/s
+  # (median 1.85) => surface Vs ~1.7 rising to ~2.4 by 3 km. The old 0.8 + 0.15/km
+  # model capped at c~1.15 < observed min -> surfdisp found no mode -> ZERO update
+  # (output == starting model). These values bracket the data.
+  init_minvel: 1.7              # surface Vs of the linear-gradient starting model
+  init_velgrad: 0.25            # Vs increase per km depth (km/s / km)
   minvel: 0.5                   # a-priori Vs bounds
   maxvel: 4.5
   weight: 4.0                   # data weight
   damp: 1.0                     # regularization damping
   sublayers: 3                  # depth-kernel sublayers (2~5)
-  maxiter: 10
+  maxiter: 200
   sparsity: 0.2                 # LSMR sparsity fraction
   noiselevel: 0.02
   threshold: 3.0                # residual outlier threshold
@@ -259,7 +277,8 @@ inversion:
     n_layers: [3, 12]          # transdimensional (BayHunter); fixed list for rfsurfhmc
     vpvs: [1.6, 2.0]
   misfit_sigma: {rf: 0.001, swd: 0.007}   # relative weighting (paper values)
-  mcmc: {chains: 6, iterations: 100000, burnin: 40000}   # BayHunter
+  mcmc: {chains: 6, iterations: 40000, burnin: 15000}   # BayHunter (40k plenty for a 1-D
+                                                        # Vs inversion w/ 4 SWD pts + RF; was 100k)
   hmc:  {generations: 200, population: 20, seed: 0}       # RfSurfHmc (if used)
 
 # -----------------------------------------------------------------------------
@@ -318,7 +337,9 @@ plot:
   ftan_period_max: 6.0                     # s
   ftan_zero_lag_mute: 1.5                  # s, Gaussian taper of the zero-lag lobe before FTAN
   cross_sections: [NS, EW]
-  vs_slice_depths_km: [2, 5, 10, 20]       # F9 Vs depth slices (tomo.path == A)
+  vs_slice_depths_km: [0.5, 1, 3, 5, 12, 15]       # F9 Vs depth slices (within the 0-5 km ANT grid)
+  vs_slice_mode: perturbation              # perturbation (% dVs from layer mean) | absolute
+  # vs_pert_clip: 5                          # +/- % cap for the perturbation colour scale (auto if unset)
   representative_stations: [ST01, ST05]    # F4 / F10 example panels (DG codes)
   # ---- F8 CCF gather ----
   # Band matters (verified by slant-stack semblance + per-pair image, 2026-07-09):

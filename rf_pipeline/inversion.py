@@ -71,6 +71,10 @@ def _hk_vpvs_prior(cfg, station) -> float | None:
             df = pd.read_csv(csv)
         except Exception:
             continue
+        # hk_corrected.csv uses a different schema (kappa_meas_*/kappa_intrinsic_* per
+        # class) with no plain 'kappa' column — skip it rather than KeyError.
+        if "station" not in df.columns or "kappa" not in df.columns:
+            continue
         row = df[df["station"] == station]
         if not row.empty:
             vals.append(float(row["kappa"].iloc[0]))
@@ -269,6 +273,9 @@ def run(cfg: dict) -> Path:
     if workers > 1:
         LOG.info(f"Stage 8: {workers} stations concurrently "
                  f"x {nchains} BayHunter chains each")
-    parallel.pmap(_invert_station_task, tasks, workers, desc="inversion")
+    # thread backend: BayHunter's mp_inversion spawns its own chain PROCESSES, so the
+    # station level must not go through the spawn process pool (can't pickle BayHunter's
+    # local chain fn). Threads launch-and-wait while the chains do the real work.
+    parallel.pmap(_invert_station_task, tasks, workers, desc="inversion", backend="thread")
     LOG.info("Stage 8 (joint inversion) complete.")
     return out_root

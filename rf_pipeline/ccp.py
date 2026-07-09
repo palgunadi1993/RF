@@ -138,9 +138,19 @@ def run(cfg: dict) -> Path:
 
     # One section per (profile, source class) so tele vs local-deep resolution
     # can be compared (PLAN.md Stage 4).
+    # Along-profile binning (paper Fig. 6 style): closely spaced bin CENTERS with
+    # an overlapping support window, i.e. a moving-window CCP stack. Every output
+    # bin is still a genuine MEAN of real migrated amplitudes (no interpolation or
+    # image smoothing) — the dense, overlapping centers are what make the section
+    # continuous instead of blocky. Set bin_km == along_step for hard, non-overlapping
+    # bins. Defaults: 0.5 km centres, 2 km support.
+    along_step = float(ccp.get("along_step", 0.5))
+    bin_km = float(ccp.get("bin_km", 2.0))
+    half = bin_km / 2.0
+
     for prof in profiles:
         _, _, L = _project_onto_profile(0.0, 0.0, prof)
-        along_bins = np.arange(0, L + 1.0, 1.0)
+        along_bins = np.arange(0.0, L + along_step / 2.0, along_step)   # centres
         width = float(prof.get("width_km", 10.0))
 
         for name in run_on:
@@ -163,6 +173,13 @@ def run(cfg: dict) -> Path:
                     amp_z, offset = migrate_trace(tr, z, vp, vs, dz)
                     if amp_z is None:
                         continue
+                    # Normalize each RF to unit peak BEFORE stacking so the section
+                    # is a "mean normalized amplitude" (paper Fig. 6) — every event
+                    # gets equal weight and one high-amplitude trace can't saturate
+                    # a sparse bin.
+                    tpk = np.nanmax(np.abs(tr.data)) if tr.data.size else 0.0
+                    if np.isfinite(tpk) and tpk > 0:
+                        amp_z = amp_z / tpk
                     baz = np.deg2rad(float(getattr(tr.stats, "back_azimuth", 0.0)))
                     # piercing point moves toward the event (back-azimuth direction)
                     px = sx + offset * np.sin(baz)
@@ -173,11 +190,16 @@ def run(cfg: dict) -> Path:
                     keep = ((np.abs(perp) <= width / 2.0)
                             & (along >= 0) & (along <= L)
                             & np.isfinite(amp_z))
-                    bi = np.clip(np.searchsorted(along_bins, along) - 1, 0,
-                                 along_bins.size - 1)
+                    # add each migrated sample to every bin centre within +/- half
+                    # (overlapping moving-window stack); the two searchsorted give
+                    # that inclusive centre range in O(log n).
                     for k in np.where(keep)[0]:
-                        grid[bi[k], k] += amp_z[k]
-                        count[bi[k], k] += 1
+                        a = along[k]
+                        lo = np.searchsorted(along_bins, a - half, side="left")
+                        hi = np.searchsorted(along_bins, a + half, side="right")
+                        if hi > lo:
+                            grid[lo:hi, k] += amp_z[k]
+                            count[lo:hi, k] += 1
 
             if count.sum() == 0:
                 LOG.info(f"[{prof['name']}/{name}] no migrated amplitudes — skipped.")

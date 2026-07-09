@@ -65,7 +65,25 @@ def _region(stations, pad=0.08):
 
 
 def _cmap_velocity(cfg):
-    return cfg.get("plot", {}).get("cmap_velocity", "roma")
+    """Resolve the velocity colormap, tolerating Scientific Colour Map names.
+
+    'roma' etc. are Crameri maps that only exist once cmcrameri is imported
+    (registered as 'cmc.roma'). Fall back to a built-in so a missing optional
+    dependency never crashes a figure.
+    """
+    name = cfg.get("plot", {}).get("cmap_velocity", "roma")
+    plt = _mpl()
+    try:
+        return plt.get_cmap(name)
+    except (ValueError, KeyError):
+        pass
+    try:
+        import cmcrameri.cm  # noqa: F401  — registers 'cmc.*' colormaps
+        return plt.get_cmap(f"cmc.{name}")
+    except Exception:
+        LOG.warning(f"colormap '{name}' unavailable (pip install cmcrameri for the "
+                    f"Scientific Colour Maps); falling back to 'turbo_r'")
+        return plt.get_cmap("turbo_r")
 
 
 # --------------------------------------------------------------------------
@@ -910,18 +928,40 @@ def F9_dispersion_maps(cfg):
         return
     d = np.load(npz)
     lon, lat, depth, vs = d["lon"], d["lat"], d["depth"], d["vs"]
-    slices = cfg.get("plot", {}).get("vs_slice_depths_km", [2, 5, 10, 20])
+    pl = cfg.get("plot", {})
     avail = np.unique(depth)
-    slices = [min(avail, key=lambda z: abs(z - s)) for s in slices]
-    clip = cfg.get("plot", {}).get("vs_clip", [0.5, 4.8])
+    # snap requested depths to available nodes, then de-duplicate (the grid may not
+    # reach the requested depth — otherwise several panels collapse onto one node)
+    want = pl.get("vs_slice_depths_km", [0.5, 1, 2, 3])
+    slices = sorted({float(min(avail, key=lambda z: abs(z - s))) for s in want})
+    mode = pl.get("vs_slice_mode", "perturbation")   # perturbation | absolute
+
+    if mode == "perturbation":
+        # % deviation from each layer's lateral mean — reveals the anomalies that a
+        # wide absolute scale washes out, and is comparable across depths
+        cval = np.full(vs.shape, np.nan)
+        for zt in avail:
+            m = np.isclose(depth, zt)
+            mu = vs[m].mean() or 1.0
+            cval[m] = 100.0 * (vs[m] - mu) / mu
+        cap = pl.get("vs_pert_clip") or float(np.nanpercentile(np.abs(cval), 98)) or 1.0
+        vmin, vmax, cmap, clabel = -cap, cap, "RdBu", "dVs from layer mean (%)"
+    else:
+        cval = vs
+        clip = pl.get("vs_clip") or [float(vs.min()), float(vs.max())]
+        vmin, vmax, cmap, clabel = clip[0], clip[1], _cmap_velocity(cfg), "Vs (km/s)"
+
     fig, axes = plt.subplots(1, len(slices), figsize=(4 * len(slices), 4), squeeze=False)
     for ax, zt in zip(axes[0], slices):
         m = np.isclose(depth, zt)
-        sc = ax.scatter(lon[m], lat[m], c=vs[m], cmap=_cmap_velocity(cfg),
-                        vmin=clip[0], vmax=clip[1], s=14, marker="s")
-        ax.set_title(f"Vs @ {zt:g} km"); ax.set_xlabel("Lon"); ax.set_ylabel("Lat")
+        sc = ax.scatter(lon[m], lat[m], c=cval[m], cmap=cmap,
+                        vmin=vmin, vmax=vmax, s=32, marker="s")
+        ttl = f"Vs @ {zt:g} km"
+        if mode == "perturbation":
+            ttl += f"\n(layer mean {vs[m].mean():.2f} km/s)"
+        ax.set_title(ttl, fontsize=9); ax.set_xlabel("Lon"); ax.set_ylabel("Lat")
         ax.set_aspect("equal")
-        fig.colorbar(sc, ax=ax, label="Vs (km/s)")
+        fig.colorbar(sc, ax=ax, label=clabel)
     fig.tight_layout()
     _save(fig, "F9_vs_depth_slices", cfg)
 

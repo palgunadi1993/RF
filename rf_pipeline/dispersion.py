@@ -111,6 +111,15 @@ def run(cfg: dict) -> Path:
         LOG.warning(f"No CCFs under {p['ccfs']} — run Stage 5 first.")
         return out_dir
 
+    # Clear stale .disp from earlier runs: a pair that fails to pick this run must NOT
+    # keep an old curve made with different periods/min_vel/ref_curve — that silently
+    # contaminates F13 and the inversion with mixed-parameter picks.
+    stale = list(Path(out_dir).glob("*.disp"))
+    for old in stale:
+        old.unlink()
+    if stale:
+        LOG.info(f"Cleared {len(stale)} stale .disp from a previous run")
+
     prm = {"periods": periods, "min_vel": min_vel, "max_vel": max_vel,
            "velband": velband, "min_wl": min_wl, "ref": ref,
            "freqmin": freqmin, "freqmax": freqmax}

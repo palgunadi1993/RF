@@ -165,9 +165,21 @@ def run(cfg: dict) -> Path:
     k_range = hk.get("k_range", [1.6, 2.5]); k_step = float(hk.get("k_step", 0.05))
     weights = hk.get("weights", [0.6, 0.3, 0.1])
     run_on = hk.get("run_on", ["teleseismic", "local_deep"])
+    overrides = hk.get("class_overrides", {}) or {}
 
-    h_grid = np.arange(h_range[0], h_range[1] + h_step / 2, h_step)
-    k_grid = np.arange(k_range[0], k_range[1] + k_step / 2, k_step)
+    def _grids(name):
+        """Per-class H/kappa search grids: class_overrides win over the globals.
+
+        Deep local events (local_deep) mostly resolve crust-to-Moho conversions;
+        without a shallower H cap the stack's global maximum can lock onto a
+        crustal multiple / side lobe far below the true interface (the ~50-56 km
+        local_deep 'Moho' picks). A per-class h_range clips that degeneracy off
+        the grid without touching the teleseismic search.
+        """
+        ov = overrides.get(name, {}) or {}
+        hr = ov.get("h_range", h_range); kr = ov.get("k_range", k_range)
+        return (np.arange(hr[0], hr[1] + h_step / 2, h_step),
+                np.arange(kr[0], kr[1] + k_step / 2, k_step))
 
     p = io_utils.paths(cfg)
     rf_dir = p["rf_out"]
@@ -175,6 +187,9 @@ def run(cfg: dict) -> Path:
 
     by_class: dict[str, pd.DataFrame] = {}
     for name in run_on:
+        h_grid, k_grid = _grids(name)
+        LOG.info(f"[{name}] H-kappa grid: H {h_grid[0]:g}-{h_grid[-1]:g} km, "
+                 f"kappa {k_grid[0]:g}-{k_grid[-1]:g}")
         rows = []
         for h5 in sorted(rf_dir.glob(f"*_{name}.h5")):
             station = h5.name[: -len(f"_{name}.h5")]
