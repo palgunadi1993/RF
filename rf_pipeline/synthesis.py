@@ -491,13 +491,21 @@ def F8_ccf_gather(cfg):
     annotate_n = pl.get("ccf_annotate_n", False)   # label each row with its pair count
     zero_lag_mute = pl.get("ccf_zero_lag_mute", 0.0)  # s; Gaussian taper of the stationary
                                                     # zero-lag lobe that otherwise masks the moveout
+    vel_mute = pl.get("ccf_vel_mute", 0.0)          # km/s; taper |t| < dist/vel_mute. Teleseisms +
+                                                    # microseisms cross the 23 km aperture as plane
+                                                    # waves (v_app >> Rayleigh) and put the strongest
+                                                    # lobe near lag 0 at EVERY offset; no local surface
+                                                    # wave can be that fast, so muting it is physical
+                                                    # and lets the dist/v moveout ("V") dominate rows
+    snr_weight = pl.get("ccf_snr_weight", False)    # weight each pair by its CCF SNR (capped at 3x
+                                                    # median) so noise-dominated pairs don't dilute bins
     pws = pl.get("ccf_pws", 0.0)                    # phase-weighted-stack power (nu); 0 = linear stack.
                                                     # nu~1 suppresses incoherent scatter within each bin
     row_norm = pl.get("ccf_row_norm", True)         # renormalize each bin to unit amplitude before
                                                     # drawing (equalizes rows; needed so PWS bins stay visible)
 
     # ---- load, filter, normalize each pair on its own signal window -------------
-    traces = []                                     # (dist_km, lag[>=0], amp)
+    traces = []                                     # (dist_km, lag[>=0], cau, aca, amp, weight)
     dmax = 0.0
     for f in files:
         d = np.load(f)
@@ -514,14 +522,28 @@ def F8_ccf_gather(cfg):
         tpos = np.arange(0.0, tmax_data, dt)
         causal = np.interp(tpos, lag, y)
         acausal = np.interp(tpos, -lag[::-1], y[::-1])
+        # pair SNR before any muting: peak in the physical arrival window over the
+        # RMS of the late coda (surface waves are long gone after 60 s at <=23 km)
+        sym = 0.5 * (causal + acausal)
+        sigw = (tpos >= dist / 3.5) & (tpos <= dist / 1.0 + 3.0)
+        noiw = (tpos >= min(60.0, 0.3 * tmax_data)) & (tpos <= min(200.0, 0.8 * tmax_data))
+        snr = np.max(np.abs(sym[sigw])) / (np.std(sym[noiw]) or 1.0) if sigw.any() else 1.0
+        cau0, aca0 = causal, acausal                 # unmuted (supplementary no-mute panel)
+        if vel_mute > 0:
+            # cosine ramp ending at dist/vel_mute: kills the high-apparent-velocity
+            # (teleseism/microseism) lobe that otherwise beats the Rayleigh arrival
+            t0 = dist / vel_mute
+            ramp = max(0.5 * t0, 0.5)
+            tap = np.clip((tpos - t0 + ramp) / ramp, 0.0, 1.0)
+            tap = 0.5 - 0.5 * np.cos(np.pi * tap)
+            causal = causal * tap
+            acausal = acausal * tap
         if zero_lag_mute > 0:
             # taper -> 0 at lag 0, -> 1 by ~2*mute; kills the stationary lobe near t=0
             taper = 1.0 - np.exp(-(tpos / zero_lag_mute) ** 2)
             causal = causal * taper
             acausal = acausal * taper
-        amp = (causal + acausal) / 2.0 if symmetric else causal
-        # (for the two-sided view we keep both branches below)
-        traces.append((dist, tpos, causal, acausal, amp))
+        traces.append((dist, tpos, cau0, aca0, causal, acausal, snr))
         dmax = max(dmax, dist)
 
     if not traces:
@@ -534,10 +556,14 @@ def F8_ccf_gather(cfg):
     tpos = traces[0][1]
     win = tpos <= lag_max
     tpos = tpos[win]
+    med_snr = float(np.median([tr[6] for tr in traces])) or 1.0
 
-    def _norm(sig):
-        m = np.max(np.abs(sig[win])) or 1.0
-        return sig[win] / m
+    def _norm(sig, w=1.0):
+        # RMS (not max) normalization: with max-norm one noise burst sets the scale
+        # and every pair enters the bin with equal say; RMS + the SNR weight lets
+        # coherent pairs dominate the stack
+        m = np.sqrt(np.mean(sig[win] ** 2)) or 1.0
+        return sig[win] / m * w
 
     def _stack(members):
         # linear mean, optionally phase-weighted (Schimmel & Paulssen 1997): the linear
@@ -551,21 +577,35 @@ def F8_ccf_gather(cfg):
             return lin * coh ** pws
         return lin
 
-    if bin_km and bin_km > 0:
-        acc = {}                                     # bin -> [amp[], cau[], aca[]]
-        for dist, _t, cau, aca, amp in traces:
-            k = int(round(dist / bin_km))
-            s = acc.setdefault(k, [[], [], []])
-            s[0].append(_norm(amp))
-            s[1].append(_norm(cau))
-            s[2].append(_norm(aca))
-        rows = [(k * bin_km, len(s[0]), _stack(s[0]), _stack(s[1]), _stack(s[2]))
-                for k, s in sorted(acc.items()) if len(s[0]) >= min_pairs]
-        spacing = bin_km
-    else:
-        rows = [(dist, 1, _norm(amp), _norm(cau), _norm(aca))
-                for dist, _t, cau, aca, amp in sorted(traces)]
-        spacing = np.median(np.diff(sorted(t[0] for t in traces))) or 0.2
+    def _make_rows(muted):
+        # build the binned/stacked gather from either the muted branches (the main
+        # display) or the unmuted ones (supplementary panel showing the stationary
+        # lag-0 contamination the velocity mute removes)
+        sel = (lambda tr: tr[4:6]) if muted else (lambda tr: tr[2:4])
+        if bin_km and bin_km > 0:
+            acc = {}                                 # bin -> [amp[], cau[], aca[]]
+            for tr in traces:
+                dist, snr = tr[0], tr[6]
+                cau, aca = sel(tr)
+                amp = 0.5 * (cau + aca) if symmetric else cau
+                w = min(snr / med_snr, 3.0) if snr_weight else 1.0
+                k = int(round(dist / bin_km))
+                s = acc.setdefault(k, [[], [], []])
+                s[0].append(_norm(amp, w))
+                s[1].append(_norm(cau, w))
+                s[2].append(_norm(aca, w))
+            return [(k * bin_km, len(s[0]), _stack(s[0]), _stack(s[1]), _stack(s[2]))
+                    for k, s in sorted(acc.items()) if len(s[0]) >= min_pairs]
+        out = []
+        for tr in sorted(traces, key=lambda tr: tr[0]):
+            cau, aca = sel(tr)
+            amp = 0.5 * (cau + aca) if symmetric else cau
+            out.append((tr[0], 1, _norm(amp), _norm(cau), _norm(aca)))
+        return out
+
+    rows = _make_rows(muted=True)
+    spacing = bin_km if (bin_km and bin_km > 0) else \
+        (np.median(np.diff(sorted(t[0] for t in traces))) or 0.2)
 
     if not rows:
         LOG.warning("F8: all distance bins culled by ccf_min_pairs — skipping.")
@@ -575,49 +615,106 @@ def F8_ccf_gather(cfg):
     lw = 0.4 if len(rows) < 60 else 0.3
 
     # ---- draw -------------------------------------------------------------------
-    fig, ax = plt.subplots(figsize=(7, 9))
-    for dist, n, sym, cau, aca in rows:
-        if symmetric:
-            branches = [(tpos, sym)]
-            rn = np.max(np.abs(sym)) if row_norm else 1.0
-        else:
-            branches = [(tpos, cau), (-tpos, aca)]   # causal right, acausal left
+    gv_win = pl.get("ccf_gv_window")               # [vmin, vmax] km/s: add a second panel with an
+                                                    # explicit group-velocity window (classic
+                                                    # separated-pulse view); null = raw panel only
+    gv_ramp = pl.get("ccf_gv_ramp", 1.5)           # s, cosine ramp outside the group-velocity window
+    envelope = pl.get("ccf_envelope", True)        # windowed panel: Hilbert envelopes, not wiggles
+
+    def _gv_taper(dist):
+        # unity between dist/vmax and dist/vmin, cosine ramps of gv_ramp outside;
+        # everything faster/slower than the window is explicitly zeroed
+        t1, t2 = dist / gv_win[1], dist / gv_win[0]
+        u = np.minimum((tpos - (t1 - gv_ramp)) / gv_ramp, (t2 + gv_ramp - tpos) / gv_ramp)
+        return 0.5 - 0.5 * np.cos(np.pi * np.clip(u, 0.0, 1.0))
+
+    def _draw(ax, rows, windowed, env, annotate):
+        for dist, n, sym, cau, aca in rows:
+            tap = _gv_taper(dist) if windowed else 1.0
+            if symmetric:
+                branches = [(tpos, sym * tap)]
+            else:
+                branches = [(tpos, cau * tap), (-tpos, aca * tap)]  # causal right, acausal left
+            if env:
+                if windowed:
+                    # mask the envelope where the taper is zero — |hilbert| of the
+                    # analytic signal rings past the window edge and spikes at lag 0
+                    branches = [(x, np.abs(hilbert(s)) * (tap > 0)) for x, s in branches]
+                elif not symmetric:
+                    # unwindowed two-sided: envelope of the continuous trace across lag 0
+                    # (per-branch hilbert puts an artificial edge spike at t=0)
+                    (xc, sc), (xa, sa) = branches
+                    x2 = np.concatenate([xa[::-1], xc[1:]])
+                    s2 = np.concatenate([sa[::-1], sc[1:]])
+                    branches = [(x2, np.abs(hilbert(s2)))]
+                else:
+                    branches = [(x, np.abs(hilbert(s))) for x, s in branches]
             # one factor for both branches keeps their relative amplitude (= noise-source asymmetry)
-            rn = max(np.max(np.abs(cau)), np.max(np.abs(aca))) if row_norm else 1.0
-        rn = rn or 1.0
-        for x, s in branches:
-            s = np.clip(s / rn, -clip, clip)
-            w = dist + s * scale
-            ax.plot(x, w, "k", lw=lw, zorder=3)
-            if fill:
-                ax.fill_between(x, dist, w, where=(s > 0), color=fill_color,
-                                lw=0, zorder=2)
-        if annotate_n and (bin_km and bin_km > 0):
-            ax.annotate(str(int(n)), xy=(lag_max, dist), xytext=(2, 0),
-                        textcoords="offset points", fontsize=5.5, color="0.5",
-                        va="center", clip_on=False)
+            rn = max(np.max(np.abs(s)) for _x, s in branches) if row_norm else 1.0
+            rn = rn or 1.0
+            # envelopes are all-positive, so full wiggle scale overlaps the row above;
+            # shrink them slightly to keep rows separated
+            esc = scale * (0.75 if env else 1.0)
+            for x, s in branches:
+                s = np.clip(s / rn, -clip, clip)
+                w = dist + s * esc
+                ax.plot(x, w, "k", lw=lw, zorder=3)
+                if fill or env:
+                    ax.fill_between(x, dist, w, where=(s > 0), color=fill_color,
+                                    lw=0, zorder=2)
+            if annotate and annotate_n and (bin_km and bin_km > 0):
+                ax.annotate(str(int(n)), xy=(lag_max, dist), xytext=(2, 0),
+                            textcoords="offset points", fontsize=5.5, color="0.5",
+                            va="center", clip_on=False)
 
-    for v in ref_vels:
-        tv = np.array([0.0, lag_max])
-        ax.plot(tv, tv * v, "--", color="0.35", lw=0.8, zorder=4)
-        if not symmetric:
-            ax.plot(-tv, tv * v, "--", color="0.35", lw=0.8, zorder=4)
-        # label each guide where it exits the panel (top edge, else right edge)
-        if dmax_show / v <= lag_max:
-            lx, ly, va, ha = dmax_show / v, dmax_show, "bottom", "center"
-        else:
-            lx, ly, va, ha = lag_max, lag_max * v, "center", "right"
-        ax.annotate(f"{v:g} km/s", xy=(lx, ly), xytext=(3, 3),
-                    textcoords="offset points", ha=ha, va=va,
-                    fontsize=7, color="0.35")
+        for v in ref_vels:
+            tv = np.array([0.0, lag_max])
+            ax.plot(tv, tv * v, "--", color="0.35", lw=0.8, zorder=4)
+            if not symmetric:
+                ax.plot(-tv, tv * v, "--", color="0.35", lw=0.8, zorder=4)
+            # label each guide where it exits the panel (top edge, else right edge)
+            if dmax_show / v <= lag_max:
+                lx, ly, va, ha = dmax_show / v, dmax_show, "bottom", "center"
+            else:
+                lx, ly, va, ha = lag_max, lag_max * v, "center", "right"
+            ax.annotate(f"{v:g} km/s", xy=(lx, ly), xytext=(3, 3),
+                        textcoords="offset points", ha=ha, va=va,
+                        fontsize=7, color="0.35")
 
-    ax.set_xlim(0 if symmetric else -lag_max, lag_max)
-    ax.set_ylim(-spacing, dmax_show + spacing)
-    ax.set_xlabel("Lag (s)")
-    ax.set_ylabel("Interstation distance (km)")
+        ax.set_xlim(0 if symmetric else -lag_max, lag_max)
+        ax.set_ylim(-spacing, dmax_show + spacing)
+        ax.set_xlabel("Lag (s)")
+
+    show_unmuted = pl.get("ccf_show_unmuted", False)   # supplementary no-mute panel: shows the
+                                                        # stationary lag-0 (teleseism/microseism)
+                                                        # column that the velocity mute removes
+    unmuted_env = pl.get("ccf_unmuted_envelope", True)  # add an envelope view of the no-mute
+                                                         # gather (lag-0 ridge vs moveout ridges)
+    panels = []                                         # (rows, windowed, env, title)
+    if show_unmuted and (vel_mute > 0 or zero_lag_mute > 0):
+        urows = _make_rows(muted=False)
+        panels.append((urows, False, False, "no mute"))
+        if unmuted_env:
+            panels.append((urows, False, True, "no mute (envelope)"))
+    mut_bits = ([f"velocity mute >{vel_mute:g} km/s"] if vel_mute > 0 else []) + \
+               ([f"lag-0 mute {zero_lag_mute:g} s"] if zero_lag_mute > 0 else [])
+    panels.append((rows, False, False, ", ".join(mut_bits) or "raw"))
+    if gv_win:
+        kind = "envelope" if envelope else "wiggle"
+        panels.append((rows, True, envelope,
+                       f"group-velocity window {gv_win[0]:g}–{gv_win[1]:g} km/s ({kind})"))
+
+    fig, axes = plt.subplots(1, len(panels), figsize=(6.2 * len(panels), 9), sharey=True)
+    axes = np.atleast_1d(axes)
     tag = "symmetric" if symmetric else "two-sided"
     grouping = f"{len(rows)} bins" if (bin_km and bin_km > 0) else f"{len(rows)} pairs"
-    ax.set_title(f"CCF gather {band[0]}–{band[1]} Hz  ({tag}, {grouping})")
+    for i, (prows, windowed, env, title) in enumerate(panels):
+        _draw(axes[i], prows, windowed, env, annotate=(i == len(panels) - 1))
+        axes[i].set_title(f"({'abcde'[i]}) {title}" if len(panels) > 1 else
+                          f"CCF gather {band[0]}–{band[1]} Hz  ({tag}, {grouping})")
+    axes[0].set_ylabel("Interstation distance (km)")
+    if len(panels) > 1:
+        fig.suptitle(f"CCF gather {band[0]}–{band[1]} Hz  ({tag}, {grouping})")
     fig.tight_layout()
     _save(fig, "F8_ccf_gather", cfg)
 

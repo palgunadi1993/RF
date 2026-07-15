@@ -32,9 +32,10 @@ LOG = get_logger("rf.ambient_noise")
 _RESP_WARNED: set[str] = set()
 
 
-def _preprocess_z(tr, sr, inv, resp_out, pre_filt):
-    """Detrend, (optionally) remove response, resample. Whitening/one-bit are left
-    to noise.noisecorr, so we do NOT normalize the spectrum here."""
+def _preprocess_z(tr, sr, inv, resp_out, pre_filt, ram_win=0.0):
+    """Detrend, (optionally) remove response, resample, and (optionally) apply
+    running-absolute-mean time normalization. Whitening is left to noise.noisecorr,
+    so we do NOT normalize the spectrum here."""
     tr = tr.copy()
     tr.detrend("demean"); tr.detrend("linear"); tr.taper(0.02)
     if inv is not None:
@@ -50,6 +51,20 @@ def _preprocess_z(tr, sr, inv, resp_out, pre_filt):
                             f"trace used WITHOUT response correction.")
     if abs(tr.stats.sampling_rate - sr) > 1e-6:
         tr.resample(sr)
+    if ram_win and ram_win > 0:
+        # Running-absolute-mean time normalization (Bensen et al. 2007): divide by
+        # the smoothed amplitude envelope so earthquakes/tremor bursts stop dominating
+        # the correlation windows. Without it, teleseisms crossing the small aperture
+        # as near-vertical plane waves stamp a zero-lag lobe on EVERY pair CCF that
+        # out-amplitudes the interstation surface wave (no "V" in the gather).
+        n = int(round(ram_win * tr.stats.sampling_rate))
+        if n >= 2:
+            w = np.convolve(np.abs(tr.data), np.ones(n) / n, mode="same")
+            pos = w[w > 0]
+            if pos.size:
+                # floor keeps zero-filled gaps from exploding; data there is 0 anyway
+                w = np.maximum(w, 0.01 * float(np.mean(pos)))
+                tr.data = tr.data / w
     return tr
 
 
@@ -71,8 +86,11 @@ def _day_task(cfg: dict, day, wfs, sta_lookup, inv, prm: dict):
             continue
         zsel = st.select(component="Z")
         if len(zsel):
-            zt[wf.station] = _preprocess_z(zsel[0], prm["target_sr"], inv,
-                                           prm["resp_out"], prm["pre_filt"])
+            ztr = zsel[0]
+            del st, zsel  # drop the two unused horizontals before the resp-removal FFT
+            zt[wf.station] = _preprocess_z(ztr, prm["target_sr"], inv,
+                                           prm["resp_out"], prm["pre_filt"],
+                                           prm.get("ram_window", 0.0))
     out = {}
     for a, b in combinations(sorted(zt), 2):
         try:
@@ -98,7 +116,11 @@ def run(cfg: dict) -> Path:
     cc_len = float(ant.get("cc_len", 3600))
     cc_step = float(ant.get("cc_step", cc_len / 2))
     overlap = float(ant.get("overlap", max(0.0, min(0.95, 1.0 - cc_step / cc_len))))
-    onebit = str(ant.get("time_norm", "")).lower() in ("one_bit", "onebit")
+    time_norm = str(ant.get("time_norm", "")).lower()
+    onebit = time_norm in ("one_bit", "onebit")
+    # 'ram' = running-absolute-mean normalization (Bensen et al. 2007), done in our
+    # own _preprocess_z (the upstream one-bit is flagged "not well implemented")
+    ram_window = float(ant.get("ram_window_s", 20.0)) if time_norm in ("ram", "running_mean") else 0.0
     whiten = str(ant.get("freq_norm", "rma")).lower() not in ("", "none", "false")
     water_level = float(ant.get("water_level", 60))
     resp_out = cfg.get("data", {}).get("response_output", "VEL")
@@ -148,9 +170,13 @@ def run(cfg: dict) -> Path:
 
     prm = {"target_sr": target_sr, "resp_out": resp_out, "pre_filt": pre_filt,
            "cc_len": cc_len, "overlap": overlap, "onebit": onebit,
-           "whiten": whiten, "water_level": water_level}
+           "whiten": whiten, "water_level": water_level, "ram_window": ram_window}
     days = sorted(by_day)
-    n_jobs = parallel.resolve_n_jobs(cfg, n_tasks=len(days))
+    # An ANT day-worker holds a full day of many-station 3C at the native rate
+    # plus a response-removal FFT spike; measured peak is ~4 GB, so tell the RAM
+    # cap that rather than let it assume the generic 2 GB and oversubscribe.
+    mem_gb = float(ant.get("mem_per_worker_gb", 4.5))
+    n_jobs = parallel.resolve_n_jobs(cfg, n_tasks=len(days), mem_per_task_gb=mem_gb)
     if n_jobs <= 1:
         for day in days:
             n_sta, day_spectra = _day_task(cfg, day, by_day[day], sta_lookup, inv, prm)
@@ -159,6 +185,7 @@ def run(cfg: dict) -> Path:
         # Fold in day order, releasing each result as it is consumed, so the
         # whole deployment's daily spectra are never all held in memory.
         LOG.info(f"ANT day correlation: {len(days)} days on {n_jobs} processes")
+        failed: list = []
         with parallel.executor(n_jobs) as ex:
             futures = [ex.submit(_day_task, cfg, day, by_day[day],
                                  sta_lookup, inv, prm) for day in days]
@@ -166,10 +193,29 @@ def run(cfg: dict) -> Path:
                 try:
                     n_sta, day_spectra = futures[i].result()
                 except Exception as e:
-                    LOG.warning(f"[{day}] correlation failed in worker ({e!r})")
+                    # A worker OOM/crash poisons the ENTIRE ProcessPoolExecutor
+                    # (BrokenProcessPool), so every still-pending day fails here
+                    # too. Don't discard them — collect and retry serially below.
+                    LOG.warning(f"[{day}] correlation failed in worker ({e!r}) "
+                                f"— queued for serial retry")
+                    failed.append(day)
                     continue
                 finally:
                     futures[i] = None
+                _fold(day, n_sta, day_spectra)
+
+        # Re-run the poisoned days in-process, one at a time: no concurrent
+        # memory pressure, so a pool that died on a single OOM still produces a
+        # complete stack instead of silently dropping the tail of the deployment.
+        if failed:
+            LOG.info(f"ANT: retrying {len(failed)} day(s) serially after pool failure")
+            for day in failed:
+                try:
+                    n_sta, day_spectra = _day_task(cfg, day, by_day[day],
+                                                   sta_lookup, inv, prm)
+                except Exception as e:
+                    LOG.warning(f"[{day}] serial retry also failed ({e!r})")
+                    continue
                 _fold(day, n_sta, day_spectra)
 
     noise = io_utils.import_amb_noise_tools(cfg)

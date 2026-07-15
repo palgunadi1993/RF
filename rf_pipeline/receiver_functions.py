@@ -191,6 +191,25 @@ def _snr(tr, onset, signal=(-2.0, 8.0), noise=(-25.0, -5.0)) -> float:
     return float(np.sqrt(np.mean(sig ** 2)) / nrms)
 
 
+def _positive_direct_p(tr, halfwin: float = 0.5) -> bool:
+    """True if the dominant pulse within ``|t| <= halfwin`` of onset is positive.
+
+    The direct P of an incident P wave must deconvolve as a positive pulse on
+    the radial-equivalent RF; a negative extremum there means the iterative
+    deconvolution locked onto a noise phase (weak vertical), and such traces
+    destroy the linear stack when mixed in. 0.5 s stays inside the direct
+    pulse even for gauss ~1.5 and excludes the ~1.8-km-interface Ps (~0.45 s)
+    only marginally — the direct P dominates it on all usable traces.
+    """
+    from obspy import UTCDateTime
+
+    t0 = UTCDateTime(tr.stats.onset)
+    seg = tr.slice(t0 - halfwin, t0 + halfwin).data
+    if seg.size == 0 or not np.all(np.isfinite(seg)):
+        return False
+    return bool(seg[np.argmax(np.abs(seg))] > 0)
+
+
 def _stack_rfs(kept, method: str = "linear", nu: float = 2.0):
     """Stack an RFStream of equal-length radial RFs: linear or phase-weighted.
 
@@ -248,6 +267,17 @@ def _station_task(ctx: dict, sta, cat, inv, index, out_dir: Path):
         slow_range = ctx["slow_range"]
         if slow_range and not (slow_range[0] <= p_km <= slow_range[1]):
             continue
+        # LQT must rotate by the APPARENT (free-surface polarization) P
+        # incidence angle, not the geometric ray angle rfstats stores: the
+        # free-surface P+SV interference tilts the P particle motion to
+        # i_app = 2*arcsin(vs0 * p) (Wiechert; Svenningsen & Jacobsen 2007),
+        # governed by the NEAR-SURFACE S velocity. Rotating by the geometric
+        # angle leaves a large direct-P spike on Q (~0.6 of unity on the Dieng
+        # nodes), which a Q-RF forward model (BayHunter/rfmini) can never fit.
+        # rf.vs_surface comes from the config; ANT gives ~2 km/s here.
+        if ctx["rotate"] == "ZNE->LQT":
+            stats.inclination = float(np.degrees(
+                2.0 * np.arcsin(min(1.0, ctx["vs_surface"] * p_km))))
         # cut a wide 3C window around the theoretical onset; rf trims later.
         st = io_utils.read_event_window_3c(stats.onset, sta, index,
                                            pre_s=60.0, post_s=120.0)
@@ -305,8 +335,16 @@ def _station_task(ctx: dict, sta, cat, inv, index, out_dir: Path):
     kept = RFStream()
     for tr in rad:
         if _snr(tr, tr.stats.onset, signal=ctx["sig_win"],
-                noise=ctx["noi_win"]) >= ctx["snr_min"]:
-            kept.append(tr)
+                noise=ctx["noi_win"]) < ctx["snr_min"]:
+            continue
+        # Physics QC: the direct P on the radial RF of an incident P wave must
+        # deconvolve with POSITIVE polarity. A negative (or absent) pulse near
+        # t=0 marks a failed deconvolution on a weak/noisy vertical — common
+        # for regional events here (40-70% of traces), and mixed signs cancel
+        # the linear stack.
+        if ctx["require_pos_p"] and not _positive_direct_p(tr):
+            continue
+        kept.append(tr)
     if len(kept) == 0:
         return (sta.code, n_events, len(rad), 0, None)
     win = ctx["win"]
@@ -369,6 +407,9 @@ def compute_class(cfg, name, stations, inv, index, out_dir,
         "ref_sdeg": float(params.get("moveout_ref_slowness", 0.06)) * _KM_PER_DEG,
         "stack": str(params.get("stack", "linear")),
         "pws_power": float(params.get("pws_power", 2.0)),
+        # near-surface Vs (km/s) for the apparent-incidence LQT rotation
+        "vs_surface": float(params.get("vs_surface", 2.0)),
+        "require_pos_p": bool(params.get("require_positive_p", False)),
     }
     ctx["radial"] = _RADIAL_COMP[ctx["rotate"]]
 

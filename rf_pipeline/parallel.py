@@ -53,16 +53,22 @@ def _available_ram_gb() -> float | None:
         return None
 
 
-def resolve_n_jobs(cfg: dict, n_tasks: int | None = None) -> int:
+def resolve_n_jobs(cfg: dict, n_tasks: int | None = None,
+                   mem_per_task_gb: float | None = None) -> int:
     """Worker count from ``project.n_jobs``, clamped by tasks *and* free RAM.
 
     - ``project.n_jobs``: -1/0/unset = all cores; a positive value is a hard ceiling.
     - clamped to ``[1, n_tasks]`` so we never spawn more workers than there is work.
-    - clamped so ``workers * project.mem_per_worker_gb`` fits in currently-available
-      RAM (minus ``project.mem_headroom_gb`` reserved for the parent + OS). This is
-      what stops an ``n_jobs: -1`` all-cores RF run from spawning 18 ObsPy workers on
-      a box that's already deep in swap and getting OOM-killed. Defaults: 2.0 GB per
-      worker, 2.0 GB headroom. Set ``mem_per_worker_gb: 0`` to disable the RAM cap.
+    - clamped so ``workers * mem_per_worker`` fits in currently-available RAM (minus
+      ``project.mem_headroom_gb`` reserved for the parent + OS). This is what stops an
+      ``n_jobs: -1`` all-cores RF run from spawning 18 ObsPy workers on a box that's
+      already deep in swap and getting OOM-killed. Defaults: 2.0 GB per worker, 2.0 GB
+      headroom. Set ``mem_per_worker_gb: 0`` to disable the RAM cap.
+    - ``mem_per_task_gb`` (arg): a stage that knows its own footprint overrides the
+      generic ``project.mem_per_worker_gb`` for this call only. ANT day-workers load a
+      full day of 25-station 3C at 100 Hz + response removal and peak ~4 GB each, far
+      above the 2 GB generic default — without this override the cap lets 18 workers
+      spawn and one gets OOM-killed, which poisons the whole ProcessPoolExecutor.
     """
     proj = cfg.get("project", {}) or {}
     try:
@@ -75,10 +81,13 @@ def resolve_n_jobs(cfg: dict, n_tasks: int | None = None) -> int:
         n = min(n, max(1, int(n_tasks)))
 
     # memory-aware cap
-    try:
-        per_worker = float(proj.get("mem_per_worker_gb", 2.0))
-    except (TypeError, ValueError):
-        per_worker = 2.0
+    if mem_per_task_gb is not None:
+        per_worker = float(mem_per_task_gb)
+    else:
+        try:
+            per_worker = float(proj.get("mem_per_worker_gb", 2.0))
+        except (TypeError, ValueError):
+            per_worker = 2.0
     try:
         headroom = float(proj.get("mem_headroom_gb", 2.0))
     except (TypeError, ValueError):

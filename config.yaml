@@ -107,25 +107,41 @@ rf:
     signal_window: [-2, 8]      # s rel. P, SNR numerator
     noise_window: [-30, -10]    # s rel. P, SNR denominator (checked pre-trim)
     snr_min: 1.5
+    require_positive_p: true    # discard RFs whose direct-P (|t|<=0.5 s) comes out
+                                # with negative polarity: failed deconvolutions on
+                                # weak-Z events. Diagnosed 2026-07-12: regional RFs
+                                # were 40-70% negative-polarity per event, so the
+                                # linear stack nearly cancelled (Stage-8 s* < 0).
     moveout_ref_slowness: 0.06  # s/km reference for the stacked-RF moveout
     stack: linear               # linear | phase_weighted (Schimmel & Paulssen)
     pws_power: 2                # nu, only used when stack: phase_weighted
+    vs_surface: 2.0             # km/s near-surface Vs for the APPARENT-incidence
+                                # LQT rotation (i_app = 2*asin(vs_surface*p));
+                                # ~2.0 from the ANT shallow Vs. Only used by
+                                # classes with rotate: ZNE->LQT.
   classes:
     teleseismic:
       rotate: ZNE->RT
-      # Paper (Criado-Sutti et al. 2026) deconvolution for the teleseismic Moho
-      # H-k: water-level, Gaussian a=0.5, c=0.1, band 0.01-2 Hz. Low-frequency +
-      # water-level gives smooth, coherently-stacking RFs -> a tight Fig. 3 peak.
-      deconvolve: freqattr        # water-level (rf 'waterlevel')
-      gauss: 0.5                  # Gaussian width a (paper)
-      deconv_params: {f1: 0.01, f2: 2.0, waterlevel: 0.1}
+      # NOTE: the paper's broadband recipe (water-level a=0.5, c=0.1, band
+      # 0.01-2 Hz) is unusable on the 5 Hz nodes — below ~0.5 Hz the response
+      # correction amplifies instrument noise, the a=0.5 pulse is so broad it
+      # merges direct-P with the Ps of the ~1.8 km interface (stack peak
+      # drifted to +1.5 s), and Stage 8 measured the stack as incoherent
+      # (s* ~ 0). Iterative time-domain decon at node bandwidth instead;
+      # deconv_params fall back to the defaults (0.03-20 Hz, 400 iters).
+      deconvolve: time
+      gauss: 1.5                  # ~1 Hz content — sharp direct P, resolvable Ps
       slowness_range: [0.04, 0.08]   # s/km (compared after s/deg -> s/km conversion)
     regional:
       rotate: ZNE->RT
       gauss: 2.5
       slowness_range: [0.06, 0.10]   # s/km
     local_deep:
-      rotate: ZNE->LQT           # steep incidence -> LQT
+      rotate: ZNE->RT            # RADIAL RF: the active engine (rfsurfhmc)
+                                 # forward-models radial P-RFs. Set back to
+                                 # ZNE->LQT (apparent-incidence rotation, see
+                                 # rf.defaults.vs_surface) if inverting with
+                                 # engine: bayhunter, whose rfmini models Q-RFs.
       gauss: 3.0                 # high-frequency content (suits 5 Hz nodes)
       phase: p                   # deep events at local distance: upgoing leg is
                                  # TauP 'p' ('P' returns ZERO arrivals here)
@@ -190,8 +206,17 @@ ant:
   cc_step: 1800                 # s, step -> overlap = 1 - cc_step/cc_len (=0.5 here)
   freq_norm: whiten             # any non-empty value -> whiten=True in noisecorr
                                 # (plain |D|+waterlevel division, not NoisePy's RMA)
-  time_norm: none               # 'one_bit' -> onebit=True in noisecorr; upstream
-                                # flags its one-bit as "not well implemented" -> off
+  time_norm: ram                # running-absolute-mean normalization (Bensen et al.
+                                # 2007), done in our _preprocess_z. REQUIRED here:
+                                # without it, Java-margin teleseisms + regionals
+                                # dominate the windows and stamp a high-apparent-
+                                # velocity lobe near lag 0 on every pair — the F8
+                                # gather then shows no interstation "V" moveout.
+                                # ('one_bit' -> upstream noisecorr onebit, which its
+                                # author flags "not well implemented"; 'none' -> off)
+  ram_window_s: 20              # s, envelope-smoothing window for time_norm: ram
+                                # (shorter = closer to one-bit; 20 s flattens quake
+                                # wavetrains while preserving second-scale noise)
   water_level: 60               # whitening water level (dB) for noisecorr
   components: ZZ                # Rayleigh (Z-Z)
   target_sampling_rate: 20      # Hz, downsample before correlation
@@ -204,11 +229,10 @@ ant:
 dispersion:
   # Reachable band only: with a 23 km aperture + min_wavelengths, periods >3-4 s have
   # ~0 eligible pairs (5 s: 2%, 6 s: 1 pair, 8 s: none), so they were empty phantoms.
-  # Reachable band only: with a 23 km aperture + min_wavelengths, periods >3-4 s have
-  # ~0 eligible pairs (5 s: 2%, 6 s: 1 pair, 8 s: none), so they were empty phantoms.
-  # 0.5 & 3 s are listed but yield no picks (scattering / coverage) -> 4 effective
-  # points at 0.75, 1, 1.5, 2 s.
-  periods: [0.5, 0.75, 1, 1.5, 2, 3]   # s (physically measurable band for this array)
+  # 0.5 & 3 s yield no picks (scattering / coverage) but stay listed: they set the
+  # freqmin/freqmax filter corners. The usable 0.75-2 s band is densely sampled —
+  # the picker interpolates each pair's continuous FTAN curve at these periods.
+  periods: [0.5, 0.75, 0.9, 1.05, 1.2, 1.4, 1.6, 1.8, 2, 3]   # s
   min_vel: 1.0                  # km/s, picking bounds — was 1.5, clipped real ~1-1.5 km/s energy
   max_vel: 5.0
   velband: [5.0, 4.5, 1.1, 0.9] # velocity_filter corners (out,in,in,out) km/s — low corners
@@ -257,7 +281,8 @@ dsurftomo:
   weight: 4.0                   # data weight
   damp: 1.0                     # regularization damping
   sublayers: 3                  # depth-kernel sublayers (2~5)
-  maxiter: 200
+  maxiter: 20                   # rms elbow is ~iter 10; beyond ~20 the anomalies grow
+                                # without bound (iter 200 reached +-30% = noise memorized)
   sparsity: 0.2                 # LSMR sparsity fraction
   noiselevel: 0.02
   threshold: 3.0                # residual outlier threshold
@@ -268,18 +293,74 @@ dsurftomo:
 # STAGE 8 — joint inversion RF + dispersion
 # -----------------------------------------------------------------------------
 inversion:
-  engine: bayhunter             # bayhunter | rfsurfhmc
-  rf_targets: [local_deep, teleseismic]   # which stacked RFs to feed jointly
+  engine: rfsurfhmc             # bayhunter | rfsurfhmc
+  rf_targets: [local_deep]      # ONLY LQT (Q-RF) classes can go here: BayHunter's
+                                # rfmini forward-models the Q-component RF (near-zero
+                                # direct P). regional/teleseismic are R-RFs (RT) for
+                                # H-k/CCP and are unfittable by rfmini — rotate a class
+                                # to ZNE->LQT before adding it back.
+  rf_resample_hz: 25            # decimate the 250 Hz stacks before BayHunter.
+                                # Nyquist 12.5 Hz keeps the full fittable band
+                                # (widest class gauss = 3 Hz corner -> nothing
+                                # above ~8 Hz); full rate is ~100x slower and
+                                # 1 GB covariance per RF target per chain. 0 = off.
   swd_targets: [phase]          # phase | group | both
   depth_max: 60                 # km
   priors:
     vs: [0.5, 4.8]              # km/s search range
     n_layers: [3, 12]          # transdimensional (BayHunter); fixed list for rfsurfhmc
     vpvs: [1.6, 2.0]
-  misfit_sigma: {rf: 0.001, swd: 0.007}   # relative weighting (paper values)
+  # misfit_sigma: {rf: 0.001, swd: 0.007}  # DISABLED: fixed sigmas this tight let the
+                                # ~1100-sample RF swamp the 4-point dispersion curve
+                                # and turn unfittable RF features into posterior bias.
+                                # When unset, BayHunter estimates the noise amplitudes
+                                # hierarchically (rfnoise_sigma/swdnoise_sigma sampled).
   mcmc: {chains: 6, iterations: 40000, burnin: 15000}   # BayHunter (40k plenty for a 1-D
                                                         # Vs inversion w/ 4 SWD pts + RF; was 100k)
-  hmc:  {generations: 200, population: 20, seed: 0}       # RfSurfHmc (if used)
+  # ---- engine: rfsurfhmc (HMC, analytic gradients; fixed layer count) ----
+  hmc:
+    nchains: 9                  # independent chains per station (parallelized as
+                                # station x chain tasks across the process pool);
+                                # 9 + jitter 0.15 = multimodality probe (n_jobs 18
+                                # packs 2 stations x 9 chains)
+    nsamples: 600               # posterior samples per chain (after warmup)
+    ndraws: 200                 # warmup samples
+    dual_averaging: true        # auto-tunes step size (Hoffman 2014, alg. 5)
+    dt: 0.005                   # leapfrog step (initial value under dual averaging;
+                                # chi^2 gradients are steep, so start small)
+    L0: 10                      # initial leapfrog steps (dual averaging)
+    Lmax: 60                    # hard cap on leapfrog steps per trajectory (DA
+                                # sets L ~ 1/dt and would otherwise explode)
+    target_ratio: 0.65          # target acceptance (dual averaging)
+    Lrange: [5, 20]             # leapfrog steps (base HMC only)
+    nbest: 10                   # models averaged for the sampler's 'mean' output
+    seed: 0
+  rfsurfhmc:
+    path: /home/kadek/Documents/software/RfSurfHmc   # clone with built model/lib/*.so
+    rf_classes: [local_deep, regional, teleseismic]   # stacked RFs to fit jointly.
+                                # The forward is a RADIAL P-RF; each class's misfit
+                                # uses an optimal amplitude scale s* (reported in
+                                # hmc_summary.txt), which absorbs deconvolution
+                                # normalization and polarity flips (negative s* =
+                                # flipped stack, e.g. regional). Drop a class here
+                                # if its s* is unstable across stations.
+    method: freq                # RF forward in freq domain (stabler per upstream)
+    water_level: 0.001
+    fit_window: [-5, 25]        # s rel. onset actually fitted (kernel cost ~ nt)
+    init_vs: [2.0, 2.2, 2.5, 2.8, 3.1, 3.8, 4.3]   # per-layer warm-start Vs; chains
+    init_jitter: 0.15           # jitter as fraction of the bound width; 0.15 spreads
+                                # the warm starts enough to test unimodality (chains
+                                # falling into bad modes get outlier_factor-dropped)
+    thk: [2, 4, 6, 8, 10, 30, 0]   # layer thicknesses, km (last 0 = halfspace);
+                                   # thicknesses are inverted within +-thk_frac
+    thk_frac: 0.3
+    noise_inflation: 2.0        # multiplies the per-class RF noise rms (estimated
+                                # from each stack's pre-onset window) to account for
+                                # correlated samples; larger = RF weighs less
+    noise_swd: null             # km/s; null = median of the disp file's sigma column
+    swd_weight: 1.0             # extra multiplier on the dispersion chi^2 (already
+                                # scaled by n_rf/n_swd to balance the RF block)
+    outlier_factor: 2.0         # drop chains with median misfit > factor x best
 
 # -----------------------------------------------------------------------------
 # STAGE 9 — synthesis / plotting
@@ -351,9 +432,16 @@ plot:
                                            #       half-width panel, crisp moveout — MSNoise standard)
                                            # false: two-sided gather (acausal at -lag, causal at +lag;
                                            #        lets you check causal/acausal symmetry = noise balance)
-  ccf_zero_lag_mute: 1.0                   # s, Gaussian taper of the stationary zero-lag lobe that
-                                           # otherwise dominates and masks the moving-out packet
-  ccf_dist_bin_km: 0.75                    # stack pairs into distance bins; 0 = per pair (raw, noisy)
+  ccf_zero_lag_mute: 0.5                   # s, Gaussian taper of the stationary zero-lag lobe (apex
+                                           # region only; the vel_mute below handles larger offsets)
+  ccf_vel_mute: 3.5                        # km/s, taper |lag| < dist/vel_mute. THE key to the "V":
+                                           # teleseisms + ocean microseisms cross the 23 km aperture as
+                                           # near-vertical plane waves, so their CCF lobe sits near lag 0
+                                           # at EVERY offset and out-amplitudes the Rayleigh arrival.
+                                           # No local surface wave travels >3.5 km/s here, so the mute
+                                           # is physical; after it the dist/v moveout dominates each row.
+  ccf_snr_weight: true                     # weight pairs by CCF SNR (capped 3x median) in the bin stack
+  ccf_dist_bin_km: 1.0                     # stack pairs into distance bins; 0 = per pair (raw, noisy)
   ccf_min_pairs: 2                         # drop distance bins with fewer pairs (undersampled far offsets)
   ccf_pws: 1.0                             # phase-weighted-stack power (nu); 0 = plain linear stack.
                                            # nu=1 suppresses incoherent volcanic scatter -> cleaner moveout
@@ -362,13 +450,20 @@ plot:
                                            # (equalizes row heights; required so PWS bins stay visible)
   ccf_fill: true                           # variable-area fill of positive lobes -> moveout pops
   ccf_fill_color: k                        # fill colour (black = seismic standard)
-  ccf_gain: 0.9                            # wiggle amplitude multiplier (<=1.0 keeps rows from overlapping)
+  ccf_gain: 1.2                            # wiggle amplitude multiplier (1 km bins tolerate slight overlap)
   ccf_clip: 1.0                            # clip normalized amplitude before scaling (tames noisy bins)
   ccf_ampli: null                          # km per unit amplitude (MSNoise 'ampli'); null = auto (bin spacing)
-  ccf_lag_max: 14                          # s, cropped lag window (moveout reaches ~dmax/2 km/s); null = auto
+  ccf_lag_max: 15                          # s, cropped lag window (moveout reaches ~dmax/1.5 km/s); null = auto
   ccf_v_min: 1.0                           # km/s, slowest wave -> sets the auto window when ccf_lag_max: null
-  ccf_ref_vels: [2.0, 3.0]                 # km/s constant-velocity moveout guides (bracket the ~2.5 km/s packet)
+  ccf_ref_vels: [1.5, 2.5]                 # km/s moveout guides (bracket the ~1.5-2.5 km/s Rayleigh packet)
   ccf_annotate_n: true                     # label each row with its pair count (explains far-offset noise)
+  ccf_gv_window: [1.0, 3.0]                # km/s, panel (b): explicit group-velocity window -> classic
+                                           # separated-pulse view; null = single raw panel
+  ccf_gv_ramp: 1.5                         # s, cosine ramp outside the group-velocity window
+  ccf_envelope: true                       # panel (b): draw Hilbert envelopes instead of wiggles
+  ccf_show_unmuted: true                   # prepend a no-mute panel (shows the stationary lag-0
+                                           # teleseism/microseism column the velocity mute removes)
+  ccf_unmuted_envelope: true               # also add an envelope view of the no-mute gather
   # ---- F7 CCP sections ----
   ccp_clim: 0.2                            # symmetric colour limit (mean norm amp)
   ccp_max_depth: 25                        # crop plotted depth (km); null = full

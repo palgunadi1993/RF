@@ -1,0 +1,8 @@
+# rf_scales: {'local_deep': 0.193, 'regional': -0.501, 'teleseismic': -0.674}
+# chain median_misfit min_misfit kept
+0 938.9610 913.5810 True
+1 932.1465 920.4369 True
+2 934.3826 921.0985 True
+3 918.7532 910.0384 True
+4 930.7170 919.8488 True
+5 934.9925 918.1673 True
